@@ -1,0 +1,20 @@
+{
+  "outPoint": {
+    "t_hash": "g0000000000000000000000000000000",
+    "n": 0
+  },
+  "txOuts": [
+    {
+      "value": {
+        "Token": 1000
+      },
+      "locktime": 0,
+      "script_public_key": "4f57405c0cc25ae5d2feef6a26e4e0ae26d53540d6b451606b0faadf2b93162c"
+    }
+  ],
+  "preimage": "{\"value\":{\"Token\":1000},\"locktime\":0,\"script_public_key\":\"4f57405c0cc25ae5d2feef6a26e4e0ae26d53540d6b451606b0faadf2b93162c\"}{\"t_hash\":\"g0000000000000000000000000000000\",\"n\":0}",
+  "signableHash": "f08be212a28668213ba2ce1cde01e85ad8df6a430ba217e6d500926976b0ce36",
+  "signatureHex": "a327fe91d43fc3a45f125b497551fa379eb70eae6e4aab6eb8294cfc720389d36cb90e9282c2b502793a05391f96676c1decccbcc8e80602e5d267d29daf5c05",
+  "assetTokenHash": "58ede68424eb1f9a7f7bda445e05162c2f3161220ab322e48ff00eed5fd663c7",
+  "assetItemHash": "74c0f8b8d515513b7d52ad9563114ed84a43b86aa93ac5e223fd52f7c6755a55"
+}

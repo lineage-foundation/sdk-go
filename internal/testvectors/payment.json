@@ -1,0 +1,71 @@
+{
+  "fetchBalanceResponse": {
+    "total": {
+      "tokens": 5000,
+      "items": {}
+    },
+    "address_list": {
+      "00f3e86263dfe18817e3176ce668230510fae34dc698cbf2b199f4b2fbf23ad5": [
+        {
+          "out_point": {
+            "t_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "n": 0
+          },
+          "value": {
+            "Token": 5000
+          }
+        }
+      ]
+    }
+  },
+  "paymentAddress": "8fc0ec86241812b4d38e102691d8010d2f5e991eaf77ec7a045ff37987d126f5",
+  "paymentAsset": {
+    "Token": 3000
+  },
+  "excessAddress": "00f3e86263dfe18817e3176ce668230510fae34dc698cbf2b199f4b2fbf23ad5",
+  "locktime": 0,
+  "senderAddress": "00f3e86263dfe18817e3176ce668230510fae34dc698cbf2b199f4b2fbf23ad5",
+  "senderPublicKey": "33b16d49e843a274fab37cccea70ac8cdced4a4b17d4c6a6297ab49faac48e66",
+  "createTxPayload": {
+    "createTx": {
+      "inputs": [
+        {
+          "previous_out": {
+            "t_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "n": 0
+          },
+          "script_signature": {
+            "Pay2PkH": {
+              "signable_data": "9ebace207d82eabd9377df74b33603cac9bdae9ff1f9d05207c61180729614f1",
+              "signature": "17cebe7e8e43e653277003ef287dbad61fe2133fd185d68699d42321caa873c73fd2dbd22bc88795bc7a1dead15a1327bf2adda9e44457c37d15b9eb84a2f906",
+              "public_key": "33b16d49e843a274fab37cccea70ac8cdced4a4b17d4c6a6297ab49faac48e66",
+              "address_version": null
+            }
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "value": {
+            "Token": 3000
+          },
+          "locktime": 0,
+          "script_public_key": "8fc0ec86241812b4d38e102691d8010d2f5e991eaf77ec7a045ff37987d126f5"
+        },
+        {
+          "value": {
+            "Token": 2000
+          },
+          "locktime": 0,
+          "script_public_key": "00f3e86263dfe18817e3176ce668230510fae34dc698cbf2b199f4b2fbf23ad5"
+        }
+      ],
+      "version": 2,
+      "druid_info": null
+    },
+    "excessAddressUsed": true,
+    "usedAddresses": [
+      "00f3e86263dfe18817e3176ce668230510fae34dc698cbf2b199f4b2fbf23ad5"
+    ]
+  }
+}

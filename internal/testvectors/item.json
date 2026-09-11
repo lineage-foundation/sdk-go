@@ -1,0 +1,18 @@
+{
+  "secretKey": "7870727639756b57325573757a34763764376f3461536a54587754726d394d6b6afb3fd73f600b0a9aee6a6de08864848101667e4facec4114f967f705117490",
+  "publicKey": "6afb3fd73f600b0a9aee6a6de08864848101667e4facec4114f967f705117490",
+  "version": null,
+  "amount": 250,
+  "defaultGenesisHashSpec": true,
+  "metadata": null,
+  "assetItemHash": "a176061273c03c226795d621845f11ce82bb8aed1f56ad71dac5906aac58f75f",
+  "payload": {
+    "item_amount": 250,
+    "script_public_key": "9b759300eb5de255eb7e27881a963ad9be3cc7ca3961cb8199f21100535a2908",
+    "public_key": "6afb3fd73f600b0a9aee6a6de08864848101667e4facec4114f967f705117490",
+    "signature": "3e1554d1e5aa2c2c7ac98e7950b63387761caa7c9ee49eff67a638bcdbec79dc2d22b27607b43a4a7bb41c83e572d90bee784e4bfae2a3abdf19372229332d0c",
+    "version": null,
+    "genesis_hash_spec": "Default",
+    "metadata": null
+  }
+}
