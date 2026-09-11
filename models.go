@@ -233,6 +233,39 @@ type TxStatus struct {
 	AdditionalInfo string       `json:"additional_info"`
 }
 
+// SerializeTransactionsRequest is the request body for
+// `POST /v1/transactions:serialize`: the transactions to serialize to
+// hex-encoded bytes, mirroring fleet_api::v1::tx_convert::CreateTransaction.
+type SerializeTransactionsRequest struct {
+	Transactions []CreateTransaction `json:"transactions"`
+}
+
+// JsonSerializedTransaction is a single transaction serialized to hex, plus
+// its resulting transaction hash.
+type JsonSerializedTransaction struct {
+	TxnHashHex string `json:"txn_hash_hex"`
+	TxnHex     string `json:"txn_hex"`
+}
+
+// SerializeTransactionsResponse is the response body for
+// `POST /v1/transactions:serialize`.
+type SerializeTransactionsResponse struct {
+	Transactions []JsonSerializedTransaction `json:"transactions"`
+}
+
+// DeserializeTransactionsRequest is the request body for
+// `POST /v1/transactions:deserialize`: hex-encoded serialized transactions to
+// decode.
+type DeserializeTransactionsRequest struct {
+	Transactions []string `json:"transactions"`
+}
+
+// DeserializeTransactionsResponse is the response body for
+// `POST /v1/transactions:deserialize`.
+type DeserializeTransactionsResponse struct {
+	Transactions []CreateTransaction `json:"transactions"`
+}
+
 // BalancesResponse is the raw response body for `GET /v1/balances` and
 // `POST /v1/balances/query`, wrapping the balance breakdown under a `balance` key.
 // Client.Balances and Client.QueryBalances unwrap this and return the inner

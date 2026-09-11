@@ -175,6 +175,26 @@ func (c *Client) QueryTransactionStatus(ctx context.Context, hashes []string) (m
 	return out, err
 }
 
+// SerializeTransactions serializes one or more transactions to hex-encoded
+// bytes, without submitting them to the mempool. Stateless; not tied to any
+// node's mempool or wallet, but the request is sent to the mempool host
+// alongside this SDK's other `/v1/transactions*` calls.
+func (c *Client) SerializeTransactions(ctx context.Context, txs []CreateTransaction) (SerializeTransactionsResponse, error) {
+	var out SerializeTransactionsResponse
+	err := c.doJSON(ctx, http.MethodPost, c.mempool, "/v1/transactions:serialize", SerializeTransactionsRequest{Transactions: txs}, &out)
+	return out, err
+}
+
+// DeserializeTransactions decodes one or more hex-encoded serialized
+// transactions, without submitting them to the mempool. Stateless; not tied
+// to any node's mempool or wallet, but the request is sent to the mempool
+// host alongside this SDK's other `/v1/transactions*` calls.
+func (c *Client) DeserializeTransactions(ctx context.Context, hexTxs []string) (DeserializeTransactionsResponse, error) {
+	var out DeserializeTransactionsResponse
+	err := c.doJSON(ctx, http.MethodPost, c.mempool, "/v1/transactions:deserialize", DeserializeTransactionsRequest{Transactions: hexTxs}, &out)
+	return out, err
+}
+
 // LatestBlock returns the most recently stored block. Hits the storage host.
 func (c *Client) LatestBlock(ctx context.Context) (LatestBlockResponse, error) {
 	var out LatestBlockResponse

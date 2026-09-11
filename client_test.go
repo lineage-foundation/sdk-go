@@ -2,6 +2,7 @@ package sdkgo
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -245,6 +246,53 @@ func TestQueryBlockchainEntries_UsesStorageHost(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Key != "k1" {
 		t.Fatalf("QueryBlockchainEntries: got %+v", got)
+	}
+}
+
+func TestSerializeTransactions_UsesMempoolHost(t *testing.T) {
+	tx := CreateTransaction{
+		Inputs:  []CreateTxIn{{PreviousOut: &OutPoint{THash: "abc", N: 0}, ScriptSignature: ScriptSig{Pay2PkH: &Pay2PkH{PublicKey: "pub"}}}},
+		Outputs: []TxOut{{Value: NewTokenAsset(100), ScriptPublicKey: "addr1"}},
+		Version: NetworkVersion,
+	}
+	wantBody, err := json.Marshal(SerializeTransactionsRequest{Transactions: []CreateTransaction{tx}})
+	if err != nil {
+		t.Fatalf("marshal want: %v", err)
+	}
+	const respBody = `{"transactions":[{"txn_hash_hex":"deadbeef","txn_hex":"0102"}]}`
+	mempool := serverExpect(t, http.MethodPost, "/v1/transactions:serialize", "", string(wantBody), http.StatusOK, respBody)
+	defer mempool.Close()
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected request to storage host: %s %s", r.Method, r.URL)
+	}))
+	defer storage.Close()
+
+	c := NewClient(Config{Mempool: mempool.URL, Storage: storage.URL})
+	got, err := c.SerializeTransactions(context.Background(), []CreateTransaction{tx})
+	if err != nil {
+		t.Fatalf("SerializeTransactions: %v", err)
+	}
+	if len(got.Transactions) != 1 || got.Transactions[0].TxnHex != "0102" || got.Transactions[0].TxnHashHex != "deadbeef" {
+		t.Fatalf("SerializeTransactions: got %+v", got)
+	}
+}
+
+func TestDeserializeTransactions_UsesMempoolHost(t *testing.T) {
+	const respBody = `{"transactions":[{"inputs":[],"outputs":[],"version":2,"druid_info":null}]}`
+	mempool := serverExpect(t, http.MethodPost, "/v1/transactions:deserialize", "", `{"transactions":["0102"]}`, http.StatusOK, respBody)
+	defer mempool.Close()
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("unexpected request to storage host: %s %s", r.Method, r.URL)
+	}))
+	defer storage.Close()
+
+	c := NewClient(Config{Mempool: mempool.URL, Storage: storage.URL})
+	got, err := c.DeserializeTransactions(context.Background(), []string{"0102"})
+	if err != nil {
+		t.Fatalf("DeserializeTransactions: %v", err)
+	}
+	if len(got.Transactions) != 1 || got.Transactions[0].Version != 2 {
+		t.Fatalf("DeserializeTransactions: got %+v", got)
 	}
 }
 
