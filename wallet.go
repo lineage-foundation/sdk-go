@@ -262,8 +262,7 @@ type createTxSubmission struct {
 }
 
 // createTransactionsSubmission is the top-level `POST /v1/transactions`
-// request body: a plain array of transactions (not the map-keyed shape of
-// CreateTransactionsRequest, which describes a different request shape).
+// request body: a plain array of transactions.
 type createTransactionsSubmission struct {
 	Transactions []createTxSubmission `json:"transactions"`
 }

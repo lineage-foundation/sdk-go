@@ -8,47 +8,59 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/lineage-foundation/sdk-go/crypto"
 )
 
 // TestCreateItems_MatchesVector is the load-bearing test for Task 10's item
-// path: CreateItems must POST /v1/items with a body byte-identical to
-// item.json's "payload" (minus the legacy "version" field, which sdk-js's
-// Wallet.createItems also drops from the wire body).
+// path: CreateItems must POST /v1/items with a body byte-identical to the
+// real sdk-js wire body.
+//
+// item.json's "payload" field is captured from sdk-js's internal
+// createItemPayload() return value, which includes a legacy "version": null
+// field. sdk-js's actual POST /v1/items request omits that field (its
+// request interface only carries item_amount, script_public_key, public_key,
+// signature, genesis_hash_spec and metadata), so payload as captured is not
+// itself the wire body — it's one field short of it being usable directly.
+// wantBody below is therefore item.json's raw payload bytes (not
+// re-marshaled through any Go struct) with the "version" field mechanically
+// struck out, compared against the actual bytes CreateItems sends, read off
+// the httptest server. That keeps this an independent (vector-vs-observed)
+// check rather than a Go-vs-Go one, while the byte-exact signature — the
+// load-bearing part of the payload — is asserted unchanged.
 func TestCreateItems_MatchesVector(t *testing.T) {
 	var v struct {
-		SecretKey              string  `json:"secretKey"`
-		PublicKey              string  `json:"publicKey"`
-		Amount                 int64   `json:"amount"`
-		DefaultGenesisHashSpec bool    `json:"defaultGenesisHashSpec"`
-		Metadata               *string `json:"metadata"`
-		Payload                struct {
-			ItemAmount      int64   `json:"item_amount"`
-			ScriptPublicKey string  `json:"script_public_key"`
-			PublicKey       string  `json:"public_key"`
-			Signature       string  `json:"signature"`
-			GenesisHashSpec string  `json:"genesis_hash_spec"`
-			Metadata        *string `json:"metadata"`
-		} `json:"payload"`
+		SecretKey              string          `json:"secretKey"`
+		PublicKey              string          `json:"publicKey"`
+		Amount                 int64           `json:"amount"`
+		DefaultGenesisHashSpec bool            `json:"defaultGenesisHashSpec"`
+		Metadata               *string         `json:"metadata"`
+		Payload                json.RawMessage `json:"payload"`
 	}
 	loadVector(t, "item.json", &v)
 
-	wantBody, err := json.Marshal(CreateItemRequest{
-		ItemAmount:      v.Payload.ItemAmount,
-		GenesisHashSpec: GenesisHashSpec(v.Payload.GenesisHashSpec),
-		Metadata:        v.Payload.Metadata,
-		ScriptPublicKey: &v.Payload.ScriptPublicKey,
-		PublicKey:       &v.Payload.PublicKey,
-		Signature:       &v.Payload.Signature,
-	})
-	if err != nil {
-		t.Fatalf("marshal want: %v", err)
+	var payload struct {
+		ScriptPublicKey string `json:"script_public_key"`
+	}
+	if err := json.Unmarshal(v.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
 	}
 
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, v.Payload); err != nil {
+		t.Fatalf("compact payload: %v", err)
+	}
+	const versionField = `"version":null,`
+	compacted := compact.String()
+	if strings.Count(compacted, versionField) != 1 {
+		t.Fatalf("item.json payload: expected exactly one %q, got %s", versionField, compacted)
+	}
+	wantBody := strings.Replace(compacted, versionField, "", 1)
+
 	const respBody = `{"asset":{"kind":"item","amount":250},"to_address":"9b759300eb5de255eb7e27881a963ad9be3cc7ca3961cb8199f21100535a2908","tx_hash":"deadbeef"}`
-	srv := serverExpect(t, http.MethodPost, "/v1/items", "", string(wantBody), http.StatusOK, respBody)
+	srv := serverExpect(t, http.MethodPost, "/v1/items", "", wantBody, http.StatusOK, respBody)
 	defer srv.Close()
 
 	w := &Wallet{Client: NewClient(Config{Mempool: srv.URL, Storage: srv.URL}), encKey: crypto.PassphraseKey("item-test-pass")}
@@ -58,8 +70,8 @@ func TestCreateItems_MatchesVector(t *testing.T) {
 		SecretKey: mustHexDecode(t, v.SecretKey),
 	}
 	address := crypto.ConstructAddress(kp.PublicKey)
-	if address != v.Payload.ScriptPublicKey {
-		t.Fatalf("sanity: derived address %s != vector script_public_key %s", address, v.Payload.ScriptPublicKey)
+	if address != payload.ScriptPublicKey {
+		t.Fatalf("sanity: derived address %s != vector script_public_key %s", address, payload.ScriptPublicKey)
 	}
 	encKp := crypto.EncryptKeypair(kp, address, "abcdefghijklmnopqrstuvwx", w.encKey)
 
@@ -67,8 +79,8 @@ func TestCreateItems_MatchesVector(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateItems: %v", err)
 	}
-	if got.ToAddress != v.Payload.ScriptPublicKey {
-		t.Fatalf("CreateItems response: got ToAddress %s want %s", got.ToAddress, v.Payload.ScriptPublicKey)
+	if got.ToAddress != payload.ScriptPublicKey {
+		t.Fatalf("CreateItems response: got ToAddress %s want %s", got.ToAddress, payload.ScriptPublicKey)
 	}
 }
 

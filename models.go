@@ -76,13 +76,6 @@ type CreateTransaction struct {
 	DruidInfo *DruidInfo   `json:"druid_info"`
 }
 
-// CreateTransactionsRequest is the top-level request body for
-// `POST /v1/transactions`: one or more transactions keyed by an arbitrary
-// caller-chosen identifier.
-type CreateTransactionsRequest struct {
-	Transactions map[string]CreateTransaction `json:"transactions"`
-}
-
 // TxOutputSummary is a single transaction output as reported back by a
 // create-transaction response: the destination address and the asset sent to it.
 type TxOutputSummary struct {
@@ -127,14 +120,21 @@ const (
 	GenesisHashSpecDefault GenesisHashSpec = "Default"
 )
 
-// CreateItemRequest is the request body for `POST /v1/items`.
+// CreateItemRequest is the request body for `POST /v1/items`. Field order
+// matches sdk-js's actual wire body (item.json's payload, minus the legacy
+// "version" field that sdk-js's request interface omits); the server is
+// serde/order-independent, so this is cosmetic, but it lets the request body
+// be compared byte-for-byte against the vector in wallet_test.go.
 type CreateItemRequest struct {
 	ItemAmount      int64           `json:"item_amount"`
-	GenesisHashSpec GenesisHashSpec `json:"genesis_hash_spec"`
-	Metadata        *string         `json:"metadata,omitempty"`
 	ScriptPublicKey *string         `json:"script_public_key,omitempty"`
 	PublicKey       *string         `json:"public_key,omitempty"`
 	Signature       *string         `json:"signature,omitempty"`
+	GenesisHashSpec GenesisHashSpec `json:"genesis_hash_spec"`
+	// Metadata has no omitempty: sdk-js's JSON.stringify keeps an explicit
+	// "metadata":null in the wire body rather than dropping the key, and
+	// item.json's vector confirms that shape.
+	Metadata *string `json:"metadata"`
 }
 
 // CreateItemResponse is the response body for a mempool-node

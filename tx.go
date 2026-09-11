@@ -23,13 +23,26 @@ const NetworkVersion = 2
 // the literal bytes "null" to the preimage. This must stay byte-identical to
 // sdk-js's construct_tx_in_out_signable_hash, since both the client and the
 // server hash the same JSON-encoded preimage.
+//
+// TxOut.Value is an Asset, whose MarshalJSON errors for an unset/unrecognized
+// Kind; every constructor in this package (NewTokenAsset/NewItemAsset) always
+// sets one, so that error is not reachable through normal use. It's still a
+// caller bug if it ever happens, and silently hashing a truncated/empty
+// preimage would produce a signature over the wrong bytes with no
+// indication, so a marshal failure here panics instead of being swallowed.
 func ConstructTxInOutSignableHash(prevOut *OutPoint, txOuts []TxOut) string {
 	var b strings.Builder
 	for _, o := range txOuts {
-		j, _ := json.Marshal(o)
+		j, err := json.Marshal(o)
+		if err != nil {
+			panic(fmt.Sprintf("sdkgo: marshal TxOut for signable hash: %v", err))
+		}
 		b.Write(j)
 	}
-	j, _ := json.Marshal(prevOut) // prevOut may be nil -> "null"
+	j, err := json.Marshal(prevOut) // prevOut may be nil -> "null"
+	if err != nil {
+		panic(fmt.Sprintf("sdkgo: marshal OutPoint for signable hash: %v", err))
+	}
 	b.Write(j)
 	h := sha3.Sum256([]byte(b.String()))
 	return hex.EncodeToString(h[:])
