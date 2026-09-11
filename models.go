@@ -109,7 +109,8 @@ type BalanceEntry struct {
 	Value    Asset    `json:"value"`
 }
 
-// FetchBalanceResponse is the response body for `POST /v1/balances/query`.
+// FetchBalanceResponse is the balance breakdown carried under the `balance` key of the
+// `GET /v1/balances` / `POST /v1/balances/query` response body (see BalancesResponse).
 type FetchBalanceResponse struct {
 	Total       BalanceTotal              `json:"total"`
 	AddressList map[string][]BalanceEntry `json:"address_list"`
@@ -172,10 +173,70 @@ type BlockchainItemMeta struct {
 	TxNum    int64                  `json:"tx_num,omitempty"`
 }
 
-// BlockchainEntry is a single stored blockchain entry as returned by
-// `POST /v1/blockchain-entries/query`.
+// DifficultyTarget is a block header's committed PoW target (`bits`), decoded into
+// its compact `nBits` form and its expanded 256-bit form, mirroring
+// fleet_api::v1::difficulty::DifficultyTarget.
+type DifficultyTarget struct {
+	// Compact is the target in Bitcoin nBits form, e.g. "0x1d00ffff".
+	Compact string `json:"compact"`
+	// Target is the full 256-bit target as 64 lowercase hex characters (no 0x prefix).
+	Target string `json:"target"`
+}
+
+// BlockchainEntry is a single stored blockchain entry (a block or a transaction), as
+// returned by `GET /v1/blocks/{num}`, `GET /v1/blocks`, `GET /v1/blockchain-entries/{key}`
+// and `POST /v1/blockchain-entries/query`, mirroring
+// fleet_api::v1::blockchain::BlockchainEntryResponse.
 type BlockchainEntry struct {
 	Key      string             `json:"key"`
 	ItemMeta BlockchainItemMeta `json:"item_meta"`
 	Data     any                `json:"data"`
+	// DifficultyTarget is set for block entries with a committed PoW target; nil for
+	// transaction entries or legacy blocks with no committed target.
+	DifficultyTarget *DifficultyTarget `json:"difficulty_target,omitempty"`
+}
+
+// SupplyResponse is the response body for `GET /v1/supply`.
+type SupplyResponse struct {
+	// Total is the fixed total token supply.
+	Total uint64 `json:"total"`
+	// Issued is the currently issued token supply.
+	Issued uint64 `json:"issued"`
+}
+
+// LatestBlockResponse is the response body for `GET /v1/blocks/latest`: the raw stored
+// block payload, plus its decoded PoW target.
+type LatestBlockResponse struct {
+	Block            any               `json:"block"`
+	DifficultyTarget *DifficultyTarget `json:"difficulty_target"`
+}
+
+// TxStatusType is the mempool status of a transaction, mirroring
+// fleet_core::interfaces::TxStatusType.
+type TxStatusType string
+
+const (
+	// TxStatusPending indicates the transaction is still in the mempool.
+	TxStatusPending TxStatusType = "Pending"
+	// TxStatusConfirmed indicates the transaction has been mined into a block.
+	TxStatusConfirmed TxStatusType = "Confirmed"
+	// TxStatusRejected indicates the transaction was rejected by the mempool.
+	TxStatusRejected TxStatusType = "Rejected"
+)
+
+// TxStatus is a single transaction's mempool status, as returned (keyed by
+// transaction hash) by `GET /v1/transactions/status` and
+// `POST /v1/transactions/status:query`.
+type TxStatus struct {
+	Status         TxStatusType `json:"status"`
+	Timestamp      int64        `json:"timestamp"`
+	AdditionalInfo string       `json:"additional_info"`
+}
+
+// BalancesResponse is the raw response body for `GET /v1/balances` and
+// `POST /v1/balances/query`, wrapping the balance breakdown under a `balance` key.
+// Client.Balances and Client.QueryBalances unwrap this and return the inner
+// FetchBalanceResponse directly.
+type BalancesResponse struct {
+	Balance FetchBalanceResponse `json:"balance"`
 }
