@@ -4,12 +4,18 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"golang.org/x/crypto/sha3"
 
 	"github.com/lineage-foundation/sdk-go/crypto"
 )
+
+// NetworkVersion is the current Lineage two-way network version, matching
+// sdk-js's NETWORK_VERSION. Every CreateTransaction built by this SDK is
+// stamped with this version.
+const NetworkVersion = 2
 
 // ConstructTxInOutSignableHash builds the signable hash for a transaction
 // input: hex(sha3_256(concat(json.Marshal(txOut) for each output) +
@@ -47,4 +53,175 @@ func ConstructItemAssetSignableHash(a Asset) string {
 	s := fmt.Sprintf("%s:%d", prefix, a.Amount)
 	h := sha3.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
+}
+
+// assetsCompatible reports whether two assets can be combined/compared: both
+// must be the same kind, and Item assets must additionally share a genesis
+// hash. Matches sdk-js's assetsAreCompatible.
+func assetsCompatible(a, b Asset) bool {
+	if a.Kind != b.Kind {
+		return false
+	}
+	if a.Kind == AssetKindItem {
+		return a.GenesisHash == b.GenesisHash
+	}
+	return true
+}
+
+// hasEnoughFunds reports whether the balance total can possibly cover
+// paymentAsset, matching the up-front check in sdk-js's getInputsForTx.
+func hasEnoughFunds(paymentAsset Asset, balance FetchBalanceResponse) bool {
+	if paymentAsset.Kind == AssetKindToken {
+		return paymentAsset.Amount <= balance.Total.Tokens
+	}
+	return paymentAsset.Amount <= balance.Total.Items[paymentAsset.GenesisHash]
+}
+
+// addressVersionForKeypair determines the address_version to record for an
+// input's script signature: nil for the current/default address derivation
+// (hex(sha3_256(publicKey))), matching sdk-js's getAddressVersion for the
+// two-argument (publicKey, address) form. This SDK does not implement the
+// deprecated/temporary address schemes, so any address that doesn't match
+// the default derivation is reported as an error.
+func addressVersionForKeypair(publicKey []byte, address string) (*int, error) {
+	if crypto.ConstructAddress(publicKey) == address {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("sdkgo: address %q does not match the default derivation for its public key (old/temp address versions are not supported)", address)
+}
+
+// getInputsForTx selects unspent outputs from balance to cover paymentAsset,
+// walking addresses in sorted order (the server's address_list is a
+// BTreeMap, so this matches its and sdk-js's iteration order for a decoded
+// JSON object). It returns the selected inputs (with placeholder-free
+// signatures to be filled in by CreatePaymentTx once outputs are known) and
+// the total asset amount gathered. Matches sdk-js's getInputsForTx.
+func getInputsForTx(paymentAsset Asset, balance FetchBalanceResponse, keyPairs map[string]crypto.Keypair) ([]CreateTxIn, Asset, error) {
+	if !hasEnoughFunds(paymentAsset, balance) {
+		return nil, Asset{}, fmt.Errorf("sdkgo: insufficient funds")
+	}
+
+	total := Asset{Kind: paymentAsset.Kind, GenesisHash: paymentAsset.GenesisHash, Metadata: paymentAsset.Metadata}
+
+	addresses := make([]string, 0, len(balance.AddressList))
+	for address := range balance.AddressList {
+		addresses = append(addresses, address)
+	}
+	sort.Strings(addresses)
+
+	var inputs []CreateTxIn
+	for _, address := range addresses {
+		kp, ok := keyPairs[address]
+		if !ok {
+			return nil, Asset{}, fmt.Errorf("sdkgo: no keypair for address %q", address)
+		}
+		addrVersion, err := addressVersionForKeypair(kp.PublicKey, address)
+		if err != nil {
+			return nil, Asset{}, err
+		}
+		for _, entry := range balance.AddressList[address] {
+			if total.Amount >= paymentAsset.Amount {
+				continue
+			}
+			if !assetsCompatible(paymentAsset, entry.Value) {
+				continue
+			}
+
+			outPoint := entry.OutPoint
+			inputs = append(inputs, CreateTxIn{
+				PreviousOut: &outPoint,
+				ScriptSignature: ScriptSig{
+					Pay2PkH: &Pay2PkH{
+						PublicKey:      hex.EncodeToString(kp.PublicKey),
+						AddressVersion: addrVersion,
+					},
+				},
+			})
+
+			total.Amount += entry.Value.Amount
+		}
+	}
+
+	return inputs, total, nil
+}
+
+// addressForOutPoint finds the address in balance.AddressList that owns the
+// out-point identified by tHash, matching sdk-js's
+// getAddressFromFetchBalanceResponse.
+func addressForOutPoint(balance FetchBalanceResponse, tHash string) (string, error) {
+	addresses := make([]string, 0, len(balance.AddressList))
+	for address := range balance.AddressList {
+		addresses = append(addresses, address)
+	}
+	sort.Strings(addresses)
+
+	for _, address := range addresses {
+		for _, entry := range balance.AddressList[address] {
+			if entry.OutPoint.THash == tHash {
+				return address, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("sdkgo: no address in balance owns out-point %q", tHash)
+}
+
+// CreatePaymentTx builds a payment transaction sending paymentAsset to
+// paymentAddress, sourcing inputs from balance and sending any change to
+// excessAddress. It replicates sdk-js's createPaymentTx (getInputsForTx +
+// createTx + updateSignatures) byte-for-byte: inputs are selected from
+// balance in address-sorted order, outputs are [payment, change] (change
+// omitted when there's no excess), and every input is (re)signed over the
+// signable hash of its previous-out plus the full output set.
+func CreatePaymentTx(paymentAddress string, paymentAsset Asset, excessAddress string, balance FetchBalanceResponse, keyPairs map[string]crypto.Keypair, locktime int) (CreateTransaction, error) {
+	inputs, totalGathered, err := getInputsForTx(paymentAsset, balance, keyPairs)
+	if err != nil {
+		return CreateTransaction{}, err
+	}
+	if len(inputs) == 0 {
+		return CreateTransaction{}, fmt.Errorf("sdkgo: no inputs available to cover payment")
+	}
+
+	outputs := []TxOut{{
+		Value:           paymentAsset,
+		Locktime:        locktime,
+		ScriptPublicKey: paymentAddress,
+	}}
+
+	if totalGathered.Amount > paymentAsset.Amount {
+		excess := paymentAsset
+		excess.Amount = totalGathered.Amount - paymentAsset.Amount
+		outputs = append(outputs, TxOut{
+			Value:           excess,
+			Locktime:        0,
+			ScriptPublicKey: excessAddress,
+		})
+	}
+
+	tx := CreateTransaction{
+		Inputs:    inputs,
+		Outputs:   outputs,
+		Version:   NetworkVersion,
+		DruidInfo: nil,
+	}
+
+	// updateSignatures: re-sign each input now that the full output set is known.
+	for i := range tx.Inputs {
+		in := &tx.Inputs[i]
+		address, err := addressForOutPoint(balance, in.PreviousOut.THash)
+		if err != nil {
+			return CreateTransaction{}, err
+		}
+		kp, ok := keyPairs[address]
+		if !ok {
+			return CreateTransaction{}, fmt.Errorf("sdkgo: no keypair for address %q", address)
+		}
+
+		signableData := ConstructTxInOutSignableHash(in.PreviousOut, tx.Outputs)
+		signature := ConstructSignature(signableData, kp.SecretKey)
+
+		in.ScriptSignature.Pay2PkH.SignableData = signableData
+		in.ScriptSignature.Pay2PkH.Signature = signature
+	}
+
+	return tx, nil
 }
