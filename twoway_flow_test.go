@@ -121,6 +121,10 @@ type statefulValenceServer struct {
 	}
 	deleted []string
 	srv     *httptest.Server
+
+	// failGetAddress, if non-empty, makes GET /messages return HTTP 500 when
+	// requested with this address header, simulating an unreachable mailbox.
+	failGetAddress string
 }
 
 func newStatefulValenceServer(t *testing.T) *statefulValenceServer {
@@ -154,6 +158,10 @@ func newStatefulValenceServer(t *testing.T) *statefulValenceServer {
 			rw.WriteHeader(http.StatusOK)
 			_, _ = rw.Write([]byte(`{"id":"` + body.ID + `"}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/messages":
+			if s.failGetAddress != "" && r.Header.Get("address") == s.failGetAddress {
+				rw.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			rw.Header().Set("Content-Type", "application/json")
 			rw.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(rw).Encode(s.store)
@@ -557,5 +565,77 @@ func TestFetchPending2WayPayment_SettlesAcceptedStoredHalf(t *testing.T) {
 
 	if len(valenceSrv.deleted) != 1 || valenceSrv.deleted[0] != half.Druid {
 		t.Errorf("valence deleted: got %v want [%s]", valenceSrv.deleted, half.Druid)
+	}
+}
+
+// TestFetchPending2WayPayment_PartialFailureKeepsProgress is the load-bearing
+// test proving FetchPending2WayPayment never discards already-committed
+// progress: given three of this wallet's own mailboxes -- one with a stored
+// half that settles successfully (submit + valence delete), one that's
+// unreachable, and one with a fresh incoming offer to discover -- a failure
+// polling the unreachable mailbox must not erase the settlement that already
+// happened, nor prevent the mailbox polled afterward from being discovered.
+// Regression test: the prior implementation returned (nil, nil, err) on the
+// very first error, silently losing on-chain-committed settlements the
+// caller could no longer learn about (their valence entry was already
+// deleted) and aborting discovery for every mailbox not yet polled.
+func TestFetchPending2WayPayment_PartialFailureKeepsProgress(t *testing.T) {
+	f := loadTwoWayFixture(t)
+	if len(f.Ours) < 3 {
+		t.Fatalf("fixture requires at least 3 'ours' addresses, got %d", len(f.Ours))
+	}
+
+	var submitted [][]byte
+	mempoolSrv := newBalanceMempoolServer(t, f.Balance, &submitted)
+	defer mempoolSrv.Close()
+
+	valenceSrv := newStatefulValenceServer(t)
+	defer valenceSrv.close()
+
+	w := &Wallet{Client: NewClient(Config{Mempool: mempoolSrv.URL, Valence: valenceSrv.srv.URL}), encKey: f.EncKey}
+
+	// Mailbox A (f.Ours[0]): a stored half whose valence entry has already
+	// flipped to "accepted" -- must settle (submit + delete) despite mailbox
+	// B's failure below.
+	paymentAddress := f.ReceiverExpectation.To
+	sendingAsset := f.ReceiverExpectation.Asset
+	receivingAsset := f.SenderExpectation.Asset
+	half, err := w.Make2WayPayment(context.Background(), paymentAddress, sendingAsset, receivingAsset, f.Ours, f.Ours[0])
+	if err != nil {
+		t.Fatalf("Make2WayPayment: %v", err)
+	}
+	submitted = nil // discount balance-only traffic from Make2WayPayment
+	filledSenderExpectation := half.SenderExpectation
+	filledSenderExpectation.From = "counterparty-supplied-tx-ins-address"
+	valenceSrv.setStatus(t, half.Druid, Pending2WTxStatusAccepted, filledSenderExpectation)
+
+	// Mailbox B (f.Ours[1]): unreachable.
+	valenceSrv.failGetAddress = f.Ours[1].Address
+
+	// Mailbox C (f.Ours[2]): a fresh incoming offer this wallet never
+	// initiated, polled *after* the failing mailbox B -- must still be
+	// discovered.
+	const otherDruid = "DRUID0xother0000000000000000000000"
+	valenceSrv.store[otherDruid] = Pending2WTxDetails{
+		Druid:               otherDruid,
+		SenderExpectation:   f.SenderExpectation,
+		ReceiverExpectation: f.ReceiverExpectation,
+		Status:              Pending2WTxStatusPending,
+		MempoolHost:         "https://mempool.lineage.to",
+	}
+
+	// allKeypairs order drives mailbox polling order: A, then failing B, then C.
+	allKeypairs := []crypto.EncryptedKeypair{f.Ours[0], f.Ours[1], f.Ours[2]}
+
+	pending, settled, err := w.FetchPending2WayPayment(context.Background(), []PendingHalf{half}, allKeypairs)
+	if err == nil {
+		t.Fatal("FetchPending2WayPayment: expected a non-nil error reporting mailbox B's failure")
+	}
+
+	if len(settled) != 1 || settled[0] != half.Druid {
+		t.Errorf("settled: got %v, want [%s] (mailbox A's already-committed settlement must survive mailbox B's later failure)", settled, half.Druid)
+	}
+	if _, ok := pending[otherDruid]; !ok {
+		t.Errorf("pending: expected druid %s (mailbox C, polled after the failing mailbox B) to still be discovered, got %v", otherDruid, pending)
 	}
 }

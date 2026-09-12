@@ -89,19 +89,22 @@ func TestCreate2WTxHalfAndConstructTxInsAddress(t *testing.T) {
 		t.Fatalf("Create2WTxHalf: %v", err)
 	}
 
-	// druid_info must match byte-for-byte.
-	var wantDruidInfo DruidInfo
-	if err := json.Unmarshal(v.Create2WTxHalf.Output.DruidInfo, &wantDruidInfo); err != nil {
-		t.Fatalf("unmarshal want druid_info: %v", err)
-	}
+	// druid_info must match byte-for-byte against the RAW vector bytes
+	// (compacted, not round-tripped through the DruidInfo struct): sdk-js's
+	// create2WTxHalf output carries no genesis_hash key at all (it's only
+	// added at submission time), and a struct round-trip through DruidInfo's
+	// non-omitempty GenesisHash field would mask a regression that adds it
+	// back in at construction. Compare compacted bytes directly instead,
+	// mirroring TestCreatePaymentTx's raw-vector comparison.
 	gotDruidInfoJSON, err := json.Marshal(tx.DruidInfo)
 	if err != nil {
 		t.Fatalf("marshal got druid_info: %v", err)
 	}
-	wantDruidInfoJSON, err := json.Marshal(&wantDruidInfo)
-	if err != nil {
-		t.Fatalf("marshal want druid_info: %v", err)
+	var wantDruidInfoBuf bytes.Buffer
+	if err := json.Compact(&wantDruidInfoBuf, v.Create2WTxHalf.Output.DruidInfo); err != nil {
+		t.Fatalf("compact want druid_info: %v", err)
 	}
+	wantDruidInfoJSON := wantDruidInfoBuf.Bytes()
 	if !bytes.Equal(gotDruidInfoJSON, wantDruidInfoJSON) {
 		t.Fatalf("druid_info mismatch:\n got:  %s\n want: %s", gotDruidInfoJSON, wantDruidInfoJSON)
 	}

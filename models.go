@@ -64,11 +64,18 @@ type DruidExpectation struct {
 
 // DruidInfo carries the DRUID (two-way trade) metadata for a transaction, mirroring
 // prime::primitives::druid::DdeValues.
+//
+// GenesisHash is omitempty: Create2WTxHalf's constructed druid_info never
+// sets it, and its JSON encoding must omit the key entirely to match
+// sdk-js's create2WTxHalf output (and the shared create2WTxHalf.output
+// vector) byte-for-byte -- sdk-js only adds an explicit genesis_hash:null at
+// submission time. That explicit-null submission shape is a distinct wire
+// type (see wallet.go's submissionDruidInfo), not this one.
 type DruidInfo struct {
 	Druid        string             `json:"druid"`
 	Participants int                `json:"participants"`
 	Expectations []DruidExpectation `json:"expectations"`
-	GenesisHash  *string            `json:"genesis_hash"`
+	GenesisHash  *string            `json:"genesis_hash,omitempty"`
 }
 
 // CreateTransaction is the request body for `POST /v1/transactions`: the inputs and
