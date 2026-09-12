@@ -350,3 +350,54 @@ type DeserializeTransactionsResponse struct {
 type BalancesResponse struct {
 	Balance FetchBalanceResponse `json:"balance"`
 }
+
+// EncryptedTransaction is the on-disk/wire representation of a passphrase-
+// encrypted CreateTransaction, matching sdk-js's ICreateTransactionEncrypted.
+// It's what Wallet.Make2WayPayment returns (inside a PendingHalf) for the
+// caller to persist until the counterparty accepts.
+type EncryptedTransaction struct {
+	Druid string `json:"druid"`
+	Nonce string `json:"nonce"`
+	Save  string `json:"save"`
+}
+
+// Pending2WTxStatus is the lifecycle status of a two-way (DRUID) trade as
+// tracked on the valence mailbox, mirroring sdk-js's
+// IPending2WTxDetails['status'].
+type Pending2WTxStatus string
+
+const (
+	// Pending2WTxStatusPending marks an offer awaiting the counterparty's response.
+	Pending2WTxStatusPending Pending2WTxStatus = "pending"
+	// Pending2WTxStatusAccepted marks an offer the counterparty has accepted.
+	Pending2WTxStatusAccepted Pending2WTxStatus = "accepted"
+	// Pending2WTxStatusRejected marks an offer the counterparty has rejected.
+	Pending2WTxStatusRejected Pending2WTxStatus = "rejected"
+)
+
+// Pending2WTxDetails is the payload stored under a valence mailbox entry for
+// a two-way (DRUID) trade: both parties' expectations, the trade's current
+// status, and the mempool host the initiating sender chose (so both parties
+// submit their halves to the same node's DRUID pool). Mirrors sdk-js's
+// IPending2WTxDetails. This struct is exchanged with valence in plaintext —
+// it is never encrypted on the wire.
+type Pending2WTxDetails struct {
+	Druid               string            `json:"druid"`
+	SenderExpectation   DruidExpectation  `json:"senderExpectation"`
+	ReceiverExpectation DruidExpectation  `json:"receiverExpectation"`
+	Status              Pending2WTxStatus `json:"status"`
+	MempoolHost         string            `json:"mempoolHost"`
+}
+
+// PendingHalf is the caller-persisted record of a two-way payment this
+// wallet initiated via Wallet.Make2WayPayment: the DRUID correlating the
+// trade, this party's half of the transaction sealed at rest under the
+// wallet's passphrase key, and both parties' expectations exactly as posted
+// to valence (for FetchPending2WayPayment to match back up against the
+// mailbox contents on a later call).
+type PendingHalf struct {
+	Druid               string               `json:"druid"`
+	EncryptedHalf       EncryptedTransaction `json:"encryptedHalf"`
+	SenderExpectation   DruidExpectation     `json:"senderExpectation"`
+	ReceiverExpectation DruidExpectation     `json:"receiverExpectation"`
+}
