@@ -1,5 +1,11 @@
 package sdkgo
 
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+)
+
 // OutPoint identifies a transaction output: the hash of the transaction that
 // created it and the index into that transaction's outputs.
 //
@@ -107,6 +113,77 @@ type BalanceEntry struct {
 type FetchBalanceResponse struct {
 	Total       BalanceTotal              `json:"total"`
 	AddressList map[string][]BalanceEntry `json:"address_list"`
+
+	// addressOrder preserves the address_list object's key order as it
+	// appeared in the JSON that produced this value (a Go map has no
+	// intrinsic order). Input-gathering in tx.go walks address_list in this
+	// order rather than sorting it, matching sdk-js's
+	// Object.entries(fetchBalanceResponse.address_list) iteration order
+	// byte-for-byte. Populated by UnmarshalJSON; nil for a FetchBalanceResponse
+	// built by hand rather than decoded from JSON, which falls back to
+	// address-sorted order.
+	addressOrder []string
+}
+
+// UnmarshalJSON decodes a FetchBalanceResponse, additionally recording the
+// address_list object's key order (see addressOrder), since Go's map type
+// does not preserve it.
+func (f *FetchBalanceResponse) UnmarshalJSON(data []byte) error {
+	type alias FetchBalanceResponse
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*f = FetchBalanceResponse(a)
+
+	var raw struct {
+		AddressList json.RawMessage `json:"address_list"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	order, err := jsonObjectKeyOrder(raw.AddressList)
+	if err != nil {
+		return err
+	}
+	f.addressOrder = order
+	return nil
+}
+
+// jsonObjectKeyOrder returns the top-level keys of the JSON object in raw, in
+// the order they appear. Returns nil (no error) for an empty, null, or
+// non-object raw value.
+func jsonObjectKeyOrder(raw json.RawMessage) ([]string, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return nil, nil
+	}
+
+	var keys []string
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return nil, fmt.Errorf("sdkgo: unexpected non-string object key %v", keyTok)
+		}
+		keys = append(keys, key)
+
+		var discard json.RawMessage
+		if err := dec.Decode(&discard); err != nil {
+			return nil, err
+		}
+	}
+	return keys, nil
 }
 
 // GenesisHashSpec selects how the genesis transaction hash of a newly created
