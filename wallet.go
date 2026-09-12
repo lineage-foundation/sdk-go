@@ -558,50 +558,62 @@ func (w *Wallet) Make2WayPayment(ctx context.Context, paymentAddress string, sen
 	}, nil
 }
 
-// FetchPending2WayPayment polls this wallet's mailboxes for the two-way
-// payments recorded in stored (each keyed by its druid, per the mailbox
-// address it was posted under — stored[i].SenderExpectation.To), settling
-// any that the counterparty has accepted: the stored half is decrypted, its
-// druid_info expectation is replaced with the counterparty-filled
-// senderExpectation now on the mailbox entry, the resulting transaction is
-// submitted to this wallet's own mempool, and the settled mailbox entry is
-// deleted. allKeypairs supplies the secret keys needed to authenticate each
-// mailbox's GET/DELETE requests (matched by SenderExpectation.To) — a
-// parameter every one of this wallet's other 2-way-payment methods also
-// requires, since PendingHalf only carries addresses, not keypairs.
+// FetchPending2WayPayment polls this wallet's own mailboxes — one per
+// address in allKeypairs, deduplicated — and does both of this wallet's
+// possible roles in a two-way (DRUID) trade against whatever it finds
+// there:
+//
+//  1. Acceptor discovery: an offer Make2WayPayment posts is addressed to
+//     whichever of the counterparty's own addresses it was handed as
+//     paymentAddress, so it lands in one of *our* mailboxes here. Any
+//     mailbox entry whose druid isn't in stored — this wallet never
+//     initiated it — is surfaced as-is in the returned pending map for the
+//     caller to inspect and Accept2WayPayment/Reject2WayPayment.
+//  2. Initiator settlement: an offer this wallet made shows up back in its
+//     own mailbox once the counterparty accepts (handle2WTxResponse posts
+//     the "accepted" status to senderExpectation.To, one of our own
+//     addresses). For any such entry — druid present in stored, status
+//     accepted — the stored half is decrypted, its druid_info expectation
+//     is replaced with the counterparty-filled senderExpectation now on the
+//     mailbox entry, the resulting transaction is submitted to this
+//     wallet's own mempool, and the settled mailbox entry is deleted.
+//
+// allKeypairs supplies both which addresses' mailboxes to poll and the
+// secret keys needed to authenticate each one's GET/DELETE requests.
 //
 // The returned pending map holds every still-outstanding (non-settled)
-// mailbox entry matched against stored, keyed by druid; settled holds the
-// druids that were just submitted and removed from valence. Mirrors sdk-js's
-// Wallet.fetchPending2WayPayment (the "accepted" branch; sdk-js's own
-// "rejected" handling is folded into that same branch as a pre-existing
-// quirk of the reference implementation, so this SDK instead simply leaves
-// rejected entries in pending for the caller to act on).
+// mailbox entry found across those mailboxes, keyed by druid — this
+// includes newly-discovered incoming offers, and any of our own stored
+// offers that are still pending or were rejected; settled holds the druids
+// that were just submitted and removed from valence. Mirrors sdk-js's
+// Wallet.fetchPending2WayPayment (the "accepted" branch, generalized across
+// every one of the wallet's own addresses rather than a single caller-
+// supplied keypair; sdk-js's own "rejected" handling is folded into that
+// same branch as a pre-existing quirk of the reference implementation, so
+// this SDK instead simply leaves rejected entries in pending for the caller
+// to act on).
 func (w *Wallet) FetchPending2WayPayment(ctx context.Context, stored []PendingHalf, allKeypairs []crypto.EncryptedKeypair) (pending map[string]Pending2WTxDetails, settled []string, err error) {
-	_, keyPairs, err := w.decryptKeypairsMap(allKeypairs)
+	addresses, keyPairs, err := w.decryptKeypairsMap(allKeypairs)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	storedByDruid := make(map[string]PendingHalf, len(stored))
-	var mailboxOrder []string
-	seenMailbox := make(map[string]bool)
 	for _, half := range stored {
 		storedByDruid[half.Druid] = half
-		if !seenMailbox[half.SenderExpectation.To] {
-			seenMailbox[half.SenderExpectation.To] = true
-			mailboxOrder = append(mailboxOrder, half.SenderExpectation.To)
-		}
 	}
 
 	pending = map[string]Pending2WTxDetails{}
 	vc := w.valenceClient()
 
-	for _, mailboxAddress := range mailboxOrder {
-		kp, ok := keyPairs[mailboxAddress]
-		if !ok {
-			return nil, nil, fmt.Errorf("sdkgo: no keypair for mailbox address %q", mailboxAddress)
+	seenMailbox := make(map[string]bool, len(addresses))
+	for _, mailboxAddress := range addresses {
+		if seenMailbox[mailboxAddress] {
+			continue
 		}
+		seenMailbox[mailboxAddress] = true
+
+		kp := keyPairs[mailboxAddress]
 
 		entries, err := vc.Get(ctx, mailboxAddress, kp)
 		if err != nil {
@@ -610,10 +622,10 @@ func (w *Wallet) FetchPending2WayPayment(ctx context.Context, stored []PendingHa
 
 		for druid, details := range entries {
 			half, ok := storedByDruid[druid]
-			if !ok {
-				continue
-			}
-			if details.Status != Pending2WTxStatusAccepted {
+			if !ok || details.Status != Pending2WTxStatusAccepted {
+				// Either an incoming offer (or status update) this wallet
+				// never initiated, or one of our own offers that isn't
+				// settled yet — surface both as pending.
 				pending[druid] = details
 				continue
 			}

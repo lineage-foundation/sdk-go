@@ -427,6 +427,57 @@ func TestReject2WayPayment_PostsRejectedWithoutSubmitting(t *testing.T) {
 	}
 }
 
+// TestFetchPending2WayPayment_DiscoversIncomingOfferForAcceptor is the
+// load-bearing test for the acceptor role: a wallet that never called
+// Make2WayPayment (so it has no stored halves at all) must still see an
+// offer that landed in one of its own addresses' mailboxes, surfaced in the
+// returned pending map so the caller can Accept2WayPayment/
+// Reject2WayPayment it. This is the exact scenario that failed against a
+// live testnet: FetchPending2WayPayment only ever derived mailboxes from
+// stored, so an acceptor with an empty stored slice polled nothing and the
+// offer was never discovered.
+func TestFetchPending2WayPayment_DiscoversIncomingOfferForAcceptor(t *testing.T) {
+	f := loadTwoWayFixture(t)
+
+	valenceSrv := newStatefulValenceServer(t)
+	defer valenceSrv.close()
+
+	// Simulate the initiator having already posted an offer into the
+	// acceptor's mailbox (f.CP.Address == f.ReceiverExpectation.To, the
+	// paymentAddress Make2WayPayment would have used), out of band.
+	offer := Pending2WTxDetails{
+		Druid:               f.Druid,
+		SenderExpectation:   f.SenderExpectation,
+		ReceiverExpectation: f.ReceiverExpectation,
+		Status:              Pending2WTxStatusPending,
+		MempoolHost:         "https://mempool.lineage.to",
+	}
+	valenceSrv.store[f.Druid] = offer
+
+	// The acceptor wallet: no stored halves (it never initiated anything),
+	// and only holds its own keypair — not the initiator's.
+	w := &Wallet{Client: NewClient(Config{Valence: valenceSrv.srv.URL}), encKey: f.EncKey}
+
+	pending, settled, err := w.FetchPending2WayPayment(context.Background(), nil, []crypto.EncryptedKeypair{f.CP})
+	if err != nil {
+		t.Fatalf("FetchPending2WayPayment: %v", err)
+	}
+
+	if len(settled) != 0 {
+		t.Errorf("settled: got %v, want none (this wallet never initiated the offer)", settled)
+	}
+	got, ok := pending[f.Druid]
+	if !ok {
+		t.Fatalf("pending: expected druid %s to be discovered, got %v", f.Druid, pending)
+	}
+	if got.Status != Pending2WTxStatusPending {
+		t.Errorf("pending[druid].Status: got %s want %s", got.Status, Pending2WTxStatusPending)
+	}
+	if got.SenderExpectation.To != f.SenderExpectation.To {
+		t.Errorf("pending[druid].SenderExpectation.To: got %s want %s", got.SenderExpectation.To, f.SenderExpectation.To)
+	}
+}
+
 // TestFetchPending2WayPayment_SettlesAcceptedStoredHalf is the load-bearing
 // test for the make -> (counterparty accepts, out of band) -> fetch
 // second-pass settlement path: FetchPending2WayPayment must recognize a
