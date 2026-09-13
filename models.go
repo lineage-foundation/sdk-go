@@ -1,5 +1,11 @@
 package sdkgo
 
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+)
+
 // OutPoint identifies a transaction output: the hash of the transaction that
 // created it and the index into that transaction's outputs.
 //
@@ -58,11 +64,18 @@ type DruidExpectation struct {
 
 // DruidInfo carries the DRUID (two-way trade) metadata for a transaction, mirroring
 // prime::primitives::druid::DdeValues.
+//
+// GenesisHash is omitempty: Create2WTxHalf's constructed druid_info never
+// sets it, and its JSON encoding must omit the key entirely to match
+// sdk-js's create2WTxHalf output (and the shared create2WTxHalf.output
+// vector) byte-for-byte -- sdk-js only adds an explicit genesis_hash:null at
+// submission time. That explicit-null submission shape is a distinct wire
+// type (see wallet.go's submissionDruidInfo), not this one.
 type DruidInfo struct {
 	Druid        string             `json:"druid"`
 	Participants int                `json:"participants"`
 	Expectations []DruidExpectation `json:"expectations"`
-	GenesisHash  *string            `json:"genesis_hash"`
+	GenesisHash  *string            `json:"genesis_hash,omitempty"`
 }
 
 // CreateTransaction is the request body for `POST /v1/transactions`: the inputs and
@@ -107,6 +120,77 @@ type BalanceEntry struct {
 type FetchBalanceResponse struct {
 	Total       BalanceTotal              `json:"total"`
 	AddressList map[string][]BalanceEntry `json:"address_list"`
+
+	// addressOrder preserves the address_list object's key order as it
+	// appeared in the JSON that produced this value (a Go map has no
+	// intrinsic order). Input-gathering in tx.go walks address_list in this
+	// order rather than sorting it, matching sdk-js's
+	// Object.entries(fetchBalanceResponse.address_list) iteration order
+	// byte-for-byte. Populated by UnmarshalJSON; nil for a FetchBalanceResponse
+	// built by hand rather than decoded from JSON, which falls back to
+	// address-sorted order.
+	addressOrder []string
+}
+
+// UnmarshalJSON decodes a FetchBalanceResponse, additionally recording the
+// address_list object's key order (see addressOrder), since Go's map type
+// does not preserve it.
+func (f *FetchBalanceResponse) UnmarshalJSON(data []byte) error {
+	type alias FetchBalanceResponse
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*f = FetchBalanceResponse(a)
+
+	var raw struct {
+		AddressList json.RawMessage `json:"address_list"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	order, err := jsonObjectKeyOrder(raw.AddressList)
+	if err != nil {
+		return err
+	}
+	f.addressOrder = order
+	return nil
+}
+
+// jsonObjectKeyOrder returns the top-level keys of the JSON object in raw, in
+// the order they appear. Returns nil (no error) for an empty, null, or
+// non-object raw value.
+func jsonObjectKeyOrder(raw json.RawMessage) ([]string, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return nil, nil
+	}
+
+	var keys []string
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return nil, fmt.Errorf("sdkgo: unexpected non-string object key %v", keyTok)
+		}
+		keys = append(keys, key)
+
+		var discard json.RawMessage
+		if err := dec.Decode(&discard); err != nil {
+			return nil, err
+		}
+	}
+	return keys, nil
 }
 
 // GenesisHashSpec selects how the genesis transaction hash of a newly created
@@ -272,4 +356,55 @@ type DeserializeTransactionsResponse struct {
 // FetchBalanceResponse directly.
 type BalancesResponse struct {
 	Balance FetchBalanceResponse `json:"balance"`
+}
+
+// EncryptedTransaction is the on-disk/wire representation of a passphrase-
+// encrypted CreateTransaction, matching sdk-js's ICreateTransactionEncrypted.
+// It's what Wallet.Make2WayPayment returns (inside a PendingHalf) for the
+// caller to persist until the counterparty accepts.
+type EncryptedTransaction struct {
+	Druid string `json:"druid"`
+	Nonce string `json:"nonce"`
+	Save  string `json:"save"`
+}
+
+// Pending2WTxStatus is the lifecycle status of a two-way (DRUID) trade as
+// tracked on the valence mailbox, mirroring sdk-js's
+// IPending2WTxDetails['status'].
+type Pending2WTxStatus string
+
+const (
+	// Pending2WTxStatusPending marks an offer awaiting the counterparty's response.
+	Pending2WTxStatusPending Pending2WTxStatus = "pending"
+	// Pending2WTxStatusAccepted marks an offer the counterparty has accepted.
+	Pending2WTxStatusAccepted Pending2WTxStatus = "accepted"
+	// Pending2WTxStatusRejected marks an offer the counterparty has rejected.
+	Pending2WTxStatusRejected Pending2WTxStatus = "rejected"
+)
+
+// Pending2WTxDetails is the payload stored under a valence mailbox entry for
+// a two-way (DRUID) trade: both parties' expectations, the trade's current
+// status, and the mempool host the initiating sender chose (so both parties
+// submit their halves to the same node's DRUID pool). Mirrors sdk-js's
+// IPending2WTxDetails. This struct is exchanged with valence in plaintext —
+// it is never encrypted on the wire.
+type Pending2WTxDetails struct {
+	Druid               string            `json:"druid"`
+	SenderExpectation   DruidExpectation  `json:"senderExpectation"`
+	ReceiverExpectation DruidExpectation  `json:"receiverExpectation"`
+	Status              Pending2WTxStatus `json:"status"`
+	MempoolHost         string            `json:"mempoolHost"`
+}
+
+// PendingHalf is the caller-persisted record of a two-way payment this
+// wallet initiated via Wallet.Make2WayPayment: the DRUID correlating the
+// trade, this party's half of the transaction sealed at rest under the
+// wallet's passphrase key, and both parties' expectations exactly as posted
+// to valence (for FetchPending2WayPayment to match back up against the
+// mailbox contents on a later call).
+type PendingHalf struct {
+	Druid               string               `json:"druid"`
+	EncryptedHalf       EncryptedTransaction `json:"encryptedHalf"`
+	SenderExpectation   DruidExpectation     `json:"senderExpectation"`
+	ReceiverExpectation DruidExpectation     `json:"receiverExpectation"`
 }

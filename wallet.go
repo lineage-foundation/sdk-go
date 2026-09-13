@@ -248,17 +248,31 @@ func (w *Wallet) CreateItems(ctx context.Context, addr crypto.EncryptedKeypair, 
 	return out, err
 }
 
+// submissionDruidInfo is the wire shape of druid_info inside a
+// `POST /v1/transactions` submission: unlike DruidInfo (used for the
+// as-constructed transaction, which omits genesis_hash entirely),
+// GenesisHash here has no omitempty, so a nil value still serializes as an
+// explicit "genesis_hash":null. This matches sdk-js's
+// `{ ...tx.druid_info, genesis_hash: null }` spread in make2WayPayment's
+// mempool submissions, which the server requires.
+type submissionDruidInfo struct {
+	Druid        string             `json:"druid"`
+	Participants int                `json:"participants"`
+	Expectations []DruidExpectation `json:"expectations"`
+	GenesisHash  *string            `json:"genesis_hash"`
+}
+
 // createTxSubmission is the wire shape of a single transaction inside a
 // `POST /v1/transactions` request body: a CreateTransaction with an explicit
 // (always-null) fees field appended, matching sdk-js's `{...tx, fees: null}`
 // spread in Wallet.makePayment. fees isn't part of the signed transaction —
 // it's a separate, nullable field required by the DTO.
 type createTxSubmission struct {
-	Inputs    []CreateTxIn `json:"inputs"`
-	Outputs   []TxOut      `json:"outputs"`
-	Version   int          `json:"version"`
-	DruidInfo *DruidInfo   `json:"druid_info"`
-	Fees      []TxOut      `json:"fees"`
+	Inputs    []CreateTxIn         `json:"inputs"`
+	Outputs   []TxOut              `json:"outputs"`
+	Version   int                  `json:"version"`
+	DruidInfo *submissionDruidInfo `json:"druid_info"`
+	Fees      []TxOut              `json:"fees"`
 }
 
 // createTransactionsSubmission is the top-level `POST /v1/transactions`
@@ -316,7 +330,7 @@ func (w *Wallet) makePayment(ctx context.Context, paymentAddress string, asset A
 			Inputs:    tx.Inputs,
 			Outputs:   tx.Outputs,
 			Version:   tx.Version,
-			DruidInfo: tx.DruidInfo,
+			DruidInfo: druidInfoForSubmission(tx.DruidInfo),
 			Fees:      nil,
 		}},
 	}
@@ -373,4 +387,375 @@ func (w *Wallet) VerifyMessage(message []byte, signatures map[string]string, key
 		}
 	}
 	return true, nil
+}
+
+/* -------------------------------------------------------------------------- */
+/*                               2-Way payment                                */
+/* -------------------------------------------------------------------------- */
+
+// valenceClient builds a ValenceClient against this wallet's configured
+// valence host, reusing the wallet's own *http.Client.
+func (w *Wallet) valenceClient() *ValenceClient {
+	return newValenceClient(w.valence, w.httpClient)
+}
+
+// encryptTransaction seals tx under key with nacl secretbox, using a fresh
+// nonce, matching sdk-js's mgmtClient.encryptTransaction. The DRUID is
+// carried alongside in cleartext (as sdk-js does) so a caller can index
+// stored halves by druid without decrypting them.
+func encryptTransaction(tx CreateTransaction, key [32]byte) (EncryptedTransaction, error) {
+	plain, err := json.Marshal(tx)
+	if err != nil {
+		return EncryptedTransaction{}, fmt.Errorf("sdkgo: marshal transaction: %w", err)
+	}
+	nonceStr, err := newNonce()
+	if err != nil {
+		return EncryptedTransaction{}, err
+	}
+	var n [24]byte
+	copy(n[:], []byte(nonceStr))
+	sealed := secretbox.Seal(nil, plain, &n, &key)
+
+	var druid string
+	if tx.DruidInfo != nil {
+		druid = tx.DruidInfo.Druid
+	}
+	return EncryptedTransaction{
+		Druid: druid,
+		Nonce: nonceStr,
+		Save:  base64.StdEncoding.EncodeToString(sealed),
+	}, nil
+}
+
+// decryptTransaction opens an EncryptedTransaction produced by
+// encryptTransaction (or by sdk-js's encryptTransaction), recovering the
+// CreateTransaction.
+func decryptTransaction(enc EncryptedTransaction, key [32]byte) (CreateTransaction, error) {
+	var n [24]byte
+	copy(n[:], []byte(enc.Nonce))
+	raw, err := base64.StdEncoding.DecodeString(enc.Save)
+	if err != nil {
+		return CreateTransaction{}, fmt.Errorf("sdkgo: decode encrypted transaction: %w", err)
+	}
+	plain, ok := secretbox.Open(nil, raw, &n, &key)
+	if !ok {
+		return CreateTransaction{}, errors.New("sdkgo: transaction decrypt failed")
+	}
+	var tx CreateTransaction
+	if err := json.Unmarshal(plain, &tx); err != nil {
+		return CreateTransaction{}, fmt.Errorf("sdkgo: unmarshal decrypted transaction: %w", err)
+	}
+	return tx, nil
+}
+
+// decryptKeypairsMap decrypts every one of keypairs under w.encKey, returning
+// both the plain address list (in keypairs' order) and an address-to-Keypair
+// map, mirroring sdk-js's keyMgmt.getAllAddressesAndKeypairMap.
+func (w *Wallet) decryptKeypairsMap(keypairs []crypto.EncryptedKeypair) ([]string, map[string]crypto.Keypair, error) {
+	addresses := make([]string, 0, len(keypairs))
+	keyPairs := make(map[string]crypto.Keypair, len(keypairs))
+	for _, enc := range keypairs {
+		kp, err := crypto.DecryptKeypair(enc, w.encKey)
+		if err != nil {
+			return nil, nil, fmt.Errorf("sdkgo: decrypt keypair for %q: %w", enc.Address, err)
+		}
+		addresses = append(addresses, enc.Address)
+		keyPairs[enc.Address] = kp
+	}
+	return addresses, keyPairs, nil
+}
+
+// druidInfoForSubmission converts info to its submission wire shape with
+// GenesisHash forced to an explicit null: the genesis hash isn't part of a
+// two-way half's signed preimage, and `/v1/transactions` requires it
+// explicit-null on submission, matching sdk-js's
+// `{ ...tx.druid_info, genesis_hash: null }` spread in make2WayPayment's
+// mempool submissions.
+func druidInfoForSubmission(info *DruidInfo) *submissionDruidInfo {
+	if info == nil {
+		return nil
+	}
+	return &submissionDruidInfo{
+		Druid:        info.Druid,
+		Participants: info.Participants,
+		Expectations: info.Expectations,
+		GenesisHash:  nil,
+	}
+}
+
+// submitTwoWayHalf POSTs tx to host's `/v1/transactions`, with fees and
+// druid_info.genesis_hash explicitly null, matching sdk-js's two-way-payment
+// mempool submissions in make2WayPayment/handle2WTxResponse/
+// fetchPending2WayPayment.
+func (w *Wallet) submitTwoWayHalf(ctx context.Context, host string, tx CreateTransaction) (CreateTransactionsResponse, error) {
+	body := createTransactionsSubmission{
+		Transactions: []createTxSubmission{{
+			Inputs:    tx.Inputs,
+			Outputs:   tx.Outputs,
+			Version:   tx.Version,
+			DruidInfo: druidInfoForSubmission(tx.DruidInfo),
+			Fees:      nil,
+		}},
+	}
+	var out CreateTransactionsResponse
+	err := w.doJSON(ctx, http.MethodPost, host, "/v1/transactions", body, &out)
+	return out, err
+}
+
+// Make2WayPayment offers a two-way (DRUID) trade to paymentAddress: this
+// wallet will pay sendingAsset to paymentAddress in exchange for
+// receivingAsset delivered to receiveKeypair's address. It builds this
+// party's transaction half (sourcing inputs from allKeypairs's addresses,
+// change back to receiveKeypair's address), posts the plaintext offer to
+// valence (addressed to paymentAddress's mailbox, signed by receiveKeypair),
+// and returns a PendingHalf — this party's half, sealed at rest under the
+// wallet's passphrase key — for the caller to persist until
+// FetchPending2WayPayment reports it settled. Mirrors sdk-js's
+// Wallet.make2WayPayment.
+func (w *Wallet) Make2WayPayment(ctx context.Context, paymentAddress string, sendingAsset, receivingAsset Asset, allKeypairs []crypto.EncryptedKeypair, receiveKeypair crypto.EncryptedKeypair) (PendingHalf, error) {
+	if len(allKeypairs) == 0 {
+		return PendingHalf{}, errors.New("sdkgo: no keypairs provided")
+	}
+
+	senderKP, err := crypto.DecryptKeypair(receiveKeypair, w.encKey)
+	if err != nil {
+		return PendingHalf{}, fmt.Errorf("sdkgo: decrypt receive keypair: %w", err)
+	}
+
+	addresses, keyPairs, err := w.decryptKeypairsMap(allKeypairs)
+	if err != nil {
+		return PendingHalf{}, err
+	}
+
+	balance, err := w.FetchBalance(ctx, addresses)
+	if err != nil {
+		return PendingHalf{}, fmt.Errorf("sdkgo: fetch balance: %w", err)
+	}
+
+	druid := GenerateDRUID()
+
+	// senderExpectation: what this (sending) party expects to receive.
+	// receiverExpectation: what the counterparty (payee) is owed by this half.
+	senderExpectation := DruidExpectation{From: "", To: receiveKeypair.Address, Asset: receivingAsset}
+	receiverExpectation := DruidExpectation{From: "", To: paymentAddress, Asset: sendingAsset}
+
+	myHalf, err := Create2WTxHalf(druid, senderExpectation, receiverExpectation, balance, keyPairs, receiveKeypair.Address, 0)
+	if err != nil {
+		return PendingHalf{}, err
+	}
+
+	// Now that this half's inputs are known, fill in the "from" the
+	// counterparty will use to correlate their acceptance transaction.
+	receiverExpectation.From = ConstructTxInsAddress(myHalf.Inputs)
+
+	encHalf, err := encryptTransaction(myHalf, w.encKey)
+	if err != nil {
+		return PendingHalf{}, err
+	}
+
+	details := Pending2WTxDetails{
+		Druid:               druid,
+		SenderExpectation:   senderExpectation,
+		ReceiverExpectation: receiverExpectation,
+		Status:              Pending2WTxStatusPending,
+		MempoolHost:         w.mempool,
+	}
+
+	if err := w.valenceClient().Post(ctx, paymentAddress, senderKP, details); err != nil {
+		return PendingHalf{}, fmt.Errorf("sdkgo: post offer to valence: %w", err)
+	}
+
+	return PendingHalf{
+		Druid:               druid,
+		EncryptedHalf:       encHalf,
+		SenderExpectation:   senderExpectation,
+		ReceiverExpectation: receiverExpectation,
+	}, nil
+}
+
+// FetchPending2WayPayment polls this wallet's own mailboxes — one per
+// address in allKeypairs, deduplicated — and does both of this wallet's
+// possible roles in a two-way (DRUID) trade against whatever it finds
+// there:
+//
+//  1. Acceptor discovery: an offer Make2WayPayment posts is addressed to
+//     whichever of the counterparty's own addresses it was handed as
+//     paymentAddress, so it lands in one of *our* mailboxes here. Any
+//     mailbox entry whose druid isn't in stored — this wallet never
+//     initiated it — is surfaced as-is in the returned pending map for the
+//     caller to inspect and Accept2WayPayment/Reject2WayPayment.
+//  2. Initiator settlement: an offer this wallet made shows up back in its
+//     own mailbox once the counterparty accepts (handle2WTxResponse posts
+//     the "accepted" status to senderExpectation.To, one of our own
+//     addresses). For any such entry — druid present in stored, status
+//     accepted — the stored half is decrypted, its druid_info expectation
+//     is replaced with the counterparty-filled senderExpectation now on the
+//     mailbox entry, the resulting transaction is submitted to this
+//     wallet's own mempool, and the settled mailbox entry is deleted.
+//
+// allKeypairs supplies both which addresses' mailboxes to poll and the
+// secret keys needed to authenticate each one's GET/DELETE requests.
+//
+// The returned pending map holds every still-outstanding (non-settled)
+// mailbox entry found across those mailboxes, keyed by druid — this
+// includes newly-discovered incoming offers, and any of our own stored
+// offers that are still pending or were rejected; settled holds the druids
+// that were just submitted and removed from valence. Mirrors sdk-js's
+// Wallet.fetchPending2WayPayment (the "accepted" branch, generalized across
+// every one of the wallet's own addresses rather than a single caller-
+// supplied keypair; sdk-js's own "rejected" handling is folded into that
+// same branch as a pre-existing quirk of the reference implementation, so
+// this SDK instead simply leaves rejected entries in pending for the caller
+// to act on).
+//
+// A failure against one mailbox, or one mailbox entry, never discards
+// progress already made against the others: pending and settled are
+// accumulated across every mailbox regardless of errors elsewhere, and are
+// always returned alongside err (rather than as nil, nil) so a caller can
+// still learn about work that has already been committed on-chain — in
+// particular, a settled druid whose valence entry has already been deleted
+// would otherwise become unrecoverable. Every error encountered is joined
+// (via errors.Join) into the returned err.
+func (w *Wallet) FetchPending2WayPayment(ctx context.Context, stored []PendingHalf, allKeypairs []crypto.EncryptedKeypair) (pending map[string]Pending2WTxDetails, settled []string, err error) {
+	addresses, keyPairs, err := w.decryptKeypairsMap(allKeypairs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	storedByDruid := make(map[string]PendingHalf, len(stored))
+	for _, half := range stored {
+		storedByDruid[half.Druid] = half
+	}
+
+	pending = map[string]Pending2WTxDetails{}
+	vc := w.valenceClient()
+
+	var errs []error
+	seenMailbox := make(map[string]bool, len(addresses))
+	for _, mailboxAddress := range addresses {
+		if seenMailbox[mailboxAddress] {
+			continue
+		}
+		seenMailbox[mailboxAddress] = true
+
+		kp := keyPairs[mailboxAddress]
+
+		entries, err := vc.Get(ctx, mailboxAddress, kp)
+		if err != nil {
+			// This mailbox is unreachable; skip it and keep polling the
+			// rest rather than aborting discovery/settlement entirely.
+			errs = append(errs, fmt.Errorf("sdkgo: fetch valence mailbox %q: %w", mailboxAddress, err))
+			continue
+		}
+
+		for druid, details := range entries {
+			half, ok := storedByDruid[druid]
+			if !ok || details.Status != Pending2WTxStatusAccepted {
+				// Either an incoming offer (or status update) this wallet
+				// never initiated, or one of our own offers that isn't
+				// settled yet — surface both as pending.
+				pending[druid] = details
+				continue
+			}
+
+			tx, err := decryptTransaction(half.EncryptedHalf, w.encKey)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("sdkgo: decrypt stored half for druid %q: %w", druid, err))
+				continue
+			}
+			if tx.DruidInfo == nil || len(tx.DruidInfo.Expectations) == 0 {
+				errs = append(errs, fmt.Errorf("sdkgo: stored half for druid %q has no DRUID expectations", druid))
+				continue
+			}
+			// The counterparty has now filled in senderExpectation.from;
+			// replace our stored (incomplete) expectation with theirs.
+			tx.DruidInfo.Expectations[0] = details.SenderExpectation
+
+			if _, err := w.submitTwoWayHalf(ctx, w.mempool, tx); err != nil {
+				errs = append(errs, fmt.Errorf("sdkgo: submit settled half for druid %q: %w", druid, err))
+				continue
+			}
+
+			if err := vc.Delete(ctx, druid, mailboxAddress, kp); err != nil {
+				// The half is already submitted on-chain even though the
+				// valence entry couldn't be cleaned up — this is
+				// committed progress and must still be reported settled.
+				errs = append(errs, fmt.Errorf("sdkgo: delete settled valence entry for druid %q: %w", druid, err))
+				settled = append(settled, druid)
+				continue
+			}
+			settled = append(settled, druid)
+		}
+	}
+
+	return pending, settled, errors.Join(errs...)
+}
+
+// handle2WTxResponse is the shared implementation behind Accept2WayPayment
+// and Reject2WayPayment: it stamps details with status, and — only when
+// accepting — builds this party's matching transaction half (paying
+// details.SenderExpectation's asset to its address, embedding
+// details.ReceiverExpectation as this party's own druid_info expectation;
+// sdk-js's accept2WayPayment role-swap relative to Make2WayPayment) and
+// submits it to details.MempoolHost, before posting the updated status back
+// to valence (addressed to details.SenderExpectation.To's mailbox, signed by
+// this party's own — details.ReceiverExpectation.To — keypair). Mirrors
+// sdk-js's private Wallet.handle2WTxResponse.
+func (w *Wallet) handle2WTxResponse(ctx context.Context, details Pending2WTxDetails, status Pending2WTxStatus, allKeypairs []crypto.EncryptedKeypair) error {
+	addresses, keyPairs, err := w.decryptKeypairsMap(allKeypairs)
+	if err != nil {
+		return err
+	}
+
+	receiverKP, ok := keyPairs[details.ReceiverExpectation.To]
+	if !ok {
+		return fmt.Errorf("sdkgo: no keypair for receiver address %q", details.ReceiverExpectation.To)
+	}
+
+	details.Status = status
+
+	if status == Pending2WTxStatusAccepted {
+		balance, err := w.FetchBalance(ctx, addresses)
+		if err != nil {
+			return fmt.Errorf("sdkgo: fetch balance: %w", err)
+		}
+
+		myHalf, err := Create2WTxHalf(details.Druid, details.ReceiverExpectation, details.SenderExpectation, balance, keyPairs, details.ReceiverExpectation.To, 0)
+		if err != nil {
+			return err
+		}
+
+		details.SenderExpectation.From = ConstructTxInsAddress(myHalf.Inputs)
+
+		if _, err := w.submitTwoWayHalf(ctx, details.MempoolHost, myHalf); err != nil {
+			return fmt.Errorf("sdkgo: submit accepted half: %w", err)
+		}
+	}
+
+	if err := w.valenceClient().Post(ctx, details.SenderExpectation.To, receiverKP, details); err != nil {
+		return fmt.Errorf("sdkgo: post %s status to valence: %w", status, err)
+	}
+	return nil
+}
+
+// Accept2WayPayment accepts a pending two-way trade offer described by
+// details: it pays details.SenderExpectation's asset to the offering party,
+// embeds this party's own details.ReceiverExpectation as its half of the
+// DRUID trade, submits the resulting transaction to details.MempoolHost, and
+// posts the accepted status (with senderExpectation.from now filled in)
+// back to valence. allKeypairs must include the keypair for
+// details.ReceiverExpectation.To (this party's own address in the offer).
+// Mirrors sdk-js's Wallet.accept2WayPayment.
+func (w *Wallet) Accept2WayPayment(ctx context.Context, details Pending2WTxDetails, allKeypairs []crypto.EncryptedKeypair) error {
+	return w.handle2WTxResponse(ctx, details, Pending2WTxStatusAccepted, allKeypairs)
+}
+
+// Reject2WayPayment declines a pending two-way trade offer described by
+// details: no transaction is built or submitted, but the rejected status is
+// posted back to valence so the offering party's FetchPending2WayPayment can
+// observe it. allKeypairs must include the keypair for
+// details.ReceiverExpectation.To (this party's own address in the offer).
+// Mirrors sdk-js's Wallet.reject2WayPayment.
+func (w *Wallet) Reject2WayPayment(ctx context.Context, details Pending2WTxDetails, allKeypairs []crypto.EncryptedKeypair) error {
+	return w.handle2WTxResponse(ctx, details, Pending2WTxStatusRejected, allKeypairs)
 }

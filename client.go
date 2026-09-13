@@ -23,6 +23,11 @@ type Config struct {
 	Mempool string
 	// Storage is the base URL of a storage-capable node (blocks, blockchain entries).
 	Storage string
+	// Valence is the base URL of a valence mailbox host, used by Wallet's
+	// two-way payment methods (Make2WayPayment, FetchPending2WayPayment,
+	// Accept2WayPayment, Reject2WayPayment) to exchange DRUID trade offers
+	// with a counterparty.
+	Valence string
 	// APIKey, when set, is sent as the x-api-key header on every request.
 	APIKey string
 	// HTTPClient, when set, is used instead of a default *http.Client.
@@ -33,6 +38,7 @@ type Config struct {
 type Client struct {
 	mempool    string
 	storage    string
+	valence    string
 	apiKey     string
 	httpClient *http.Client
 }
@@ -47,6 +53,7 @@ func NewClient(cfg Config) *Client {
 	return &Client{
 		mempool:    cfg.Mempool,
 		storage:    cfg.Storage,
+		valence:    cfg.Valence,
 		apiKey:     cfg.APIKey,
 		httpClient: httpClient,
 	}

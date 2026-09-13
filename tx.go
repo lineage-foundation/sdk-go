@@ -103,12 +103,38 @@ func addressVersionForKeypair(publicKey []byte, address string) (*int, error) {
 	return nil, fmt.Errorf("sdkgo: address %q does not match the default derivation for its public key (old/temp address versions are not supported)", address)
 }
 
+// addressListOrder returns the addresses of balance.AddressList in the order
+// input-gathering should walk them: the JSON address_list object's original
+// key order when balance was decoded from JSON (see
+// FetchBalanceResponse.addressOrder), matching sdk-js's
+// Object.entries(fetchBalanceResponse.address_list) byte-for-byte; falling
+// back to address-sorted order for a FetchBalanceResponse built by hand.
+func addressListOrder(balance FetchBalanceResponse) []string {
+	if len(balance.addressOrder) > 0 {
+		addresses := make([]string, 0, len(balance.addressOrder))
+		seen := make(map[string]bool, len(balance.addressOrder))
+		for _, address := range balance.addressOrder {
+			if _, ok := balance.AddressList[address]; ok && !seen[address] {
+				addresses = append(addresses, address)
+				seen[address] = true
+			}
+		}
+		return addresses
+	}
+
+	addresses := make([]string, 0, len(balance.AddressList))
+	for address := range balance.AddressList {
+		addresses = append(addresses, address)
+	}
+	sort.Strings(addresses)
+	return addresses
+}
+
 // getInputsForTx selects unspent outputs from balance to cover paymentAsset,
-// walking addresses in sorted order (the server's address_list is a
-// BTreeMap, so this matches its and sdk-js's iteration order for a decoded
-// JSON object). It returns the selected inputs (with placeholder-free
-// signatures to be filled in by CreatePaymentTx once outputs are known) and
-// the total asset amount gathered. Matches sdk-js's getInputsForTx.
+// walking addresses in addressListOrder(balance). It returns the selected
+// inputs (with placeholder-free signatures to be filled in by
+// CreatePaymentTx once outputs are known) and the total asset amount
+// gathered. Matches sdk-js's getInputsForTx.
 func getInputsForTx(paymentAsset Asset, balance FetchBalanceResponse, keyPairs map[string]crypto.Keypair) ([]CreateTxIn, Asset, error) {
 	if !hasEnoughFunds(paymentAsset, balance) {
 		return nil, Asset{}, fmt.Errorf("sdkgo: insufficient funds")
@@ -116,11 +142,7 @@ func getInputsForTx(paymentAsset Asset, balance FetchBalanceResponse, keyPairs m
 
 	total := Asset{Kind: paymentAsset.Kind, GenesisHash: paymentAsset.GenesisHash, Metadata: paymentAsset.Metadata}
 
-	addresses := make([]string, 0, len(balance.AddressList))
-	for address := range balance.AddressList {
-		addresses = append(addresses, address)
-	}
-	sort.Strings(addresses)
+	addresses := addressListOrder(balance)
 
 	var inputs []CreateTxIn
 	for _, address := range addresses {
@@ -162,11 +184,7 @@ func getInputsForTx(paymentAsset Asset, balance FetchBalanceResponse, keyPairs m
 // out-point identified by tHash, matching sdk-js's
 // getAddressFromFetchBalanceResponse.
 func addressForOutPoint(balance FetchBalanceResponse, tHash string) (string, error) {
-	addresses := make([]string, 0, len(balance.AddressList))
-	for address := range balance.AddressList {
-		addresses = append(addresses, address)
-	}
-	sort.Strings(addresses)
+	addresses := addressListOrder(balance)
 
 	for _, address := range addresses {
 		for _, entry := range balance.AddressList[address] {
@@ -186,6 +204,35 @@ func addressForOutPoint(balance FetchBalanceResponse, tHash string) (string, err
 // omitted when there's no excess), and every input is (re)signed over the
 // signable hash of its previous-out plus the full output set.
 func CreatePaymentTx(paymentAddress string, paymentAsset Asset, excessAddress string, balance FetchBalanceResponse, keyPairs map[string]crypto.Keypair, locktime int) (CreateTransaction, error) {
+	return createTxWithDruidInfo(paymentAddress, paymentAsset, excessAddress, balance, keyPairs, locktime, nil)
+}
+
+// Create2WTxHalf builds one half of a two-way (DRUID) trade: an ordinary
+// P2PKH transaction that pays counterExpectation.asset to
+// counterExpectation.to (plus any excess back to excessAddress), carrying
+// thisExpectation as this party's half of the DRUID trade metadata.
+//
+// It replicates sdk-js's create2WTxHalf byte-for-byte: input selection and
+// output/signature construction are exactly CreatePaymentTx's (driven by
+// counterExpectation.asset/to), and druid_info is attached as
+// { druid, participants: 2, expectations: [thisExpectation] } — unsigned,
+// and never folded into any signable preimage. Each input is signed exactly
+// as in the 1-way path, over ConstructTxInOutSignableHash(input.previous_out,
+// outputs).
+func Create2WTxHalf(druid string, thisExpectation, counterExpectation DruidExpectation, balance FetchBalanceResponse, keyPairs map[string]crypto.Keypair, excessAddress string, locktime int) (CreateTransaction, error) {
+	druidInfo := &DruidInfo{
+		Druid:        druid,
+		Participants: 2,
+		Expectations: []DruidExpectation{thisExpectation},
+	}
+	return createTxWithDruidInfo(counterExpectation.To, counterExpectation.Asset, excessAddress, balance, keyPairs, locktime, druidInfo)
+}
+
+// createTxWithDruidInfo is the shared core of CreatePaymentTx and
+// Create2WTxHalf: gather inputs for paymentAsset, build [payment, change]
+// outputs, sign every input over the full output set, and stamp druidInfo
+// (nil for an ordinary 1-way payment) onto the result.
+func createTxWithDruidInfo(paymentAddress string, paymentAsset Asset, excessAddress string, balance FetchBalanceResponse, keyPairs map[string]crypto.Keypair, locktime int, druidInfo *DruidInfo) (CreateTransaction, error) {
 	inputs, totalGathered, err := getInputsForTx(paymentAsset, balance, keyPairs)
 	if err != nil {
 		return CreateTransaction{}, err
@@ -214,7 +261,7 @@ func CreatePaymentTx(paymentAddress string, paymentAsset Asset, excessAddress st
 		Inputs:    inputs,
 		Outputs:   outputs,
 		Version:   NetworkVersion,
-		DruidInfo: nil,
+		DruidInfo: druidInfo,
 	}
 
 	// updateSignatures: re-sign each input now that the full output set is known.
@@ -237,4 +284,55 @@ func CreatePaymentTx(paymentAddress string, paymentAsset Asset, excessAddress st
 	}
 
 	return tx, nil
+}
+
+// ConstructTxInsAddress derives the "from" address used to correlate the two
+// halves of a DRUID trade from a transaction's inputs:
+// hex(sha3_256(joined per-input P2PKH script strings)). It replicates
+// sdk-js's constructTxInsAddress / getFormattedScriptString byte-for-byte,
+// including sdk-js's exact P2PKH stack layout (Bytes/Signature/PubKey/Op
+// entries), even though this SDK does not otherwise construct or evaluate
+// scripts.
+func ConstructTxInsAddress(inputs []CreateTxIn) string {
+	parts := make([]string, len(inputs))
+	for i, in := range inputs {
+		parts[i] = txInAddressPart(in)
+	}
+	joined := strings.Join(parts, "-")
+	h := sha3.Sum256([]byte(joined))
+	return hex.EncodeToString(h[:])
+}
+
+// txInAddressPart formats a single input as sdk-js's constructTxInsAddress
+// does: "{n}-{t_hash}-{p2pkh script string}" (or "null-{...}" when
+// previous_out is absent).
+func txInAddressPart(in CreateTxIn) string {
+	sig := in.ScriptSignature.Pay2PkH
+
+	hashOp := "OP_HASH256"
+	if sig.AddressVersion != nil && *sig.AddressVersion != 1 {
+		hashOp = "OP_HASH256_TEMP"
+	}
+
+	pubKeyBytes, err := hex.DecodeString(sig.PublicKey)
+	if err != nil {
+		panic(fmt.Sprintf("sdkgo: decode public key for tx-ins address: %v", err))
+	}
+	address := crypto.ConstructAddress(pubKeyBytes)
+
+	script := strings.Join([]string{
+		"Bytes:" + sig.SignableData,
+		"Signature:" + sig.Signature,
+		"PubKey:" + sig.PublicKey,
+		"Op:OP_DUP",
+		"Op:" + hashOp,
+		"Bytes:" + address,
+		"Op:OP_EQUALVERIFY",
+		"Op:OP_CHECKSIG",
+	}, "-")
+
+	if in.PreviousOut == nil {
+		return "null-" + script
+	}
+	return fmt.Sprintf("%d-%s-%s", in.PreviousOut.N, in.PreviousOut.THash, script)
 }

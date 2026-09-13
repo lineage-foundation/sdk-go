@@ -135,18 +135,93 @@ LINEAGE_TEST_HOST=http://localhost:3000 go test -tags=integration ./...
 Without the tag (`go test ./...`, the default), this test file isn't even compiled
 in.
 
-## Not yet supported
+## Two-way (DRUID) payments
 
-Two-way (DRUID) payments are not yet implemented by this SDK. `DruidInfo` exists on
-`CreateTransaction` for wire compatibility (so this SDK can read/round-trip
-transactions that carry it), but there is no wallet-level API yet for constructing or
-accepting a 2-way trade. See sdk-js/sdk-python for 2-way payment support via the
-separate Valence service in the meantime.
+A two-way payment is an atomic swap between two parties, brokered through
+[Valence](https://github.com/lineage-foundation/valence), a plaintext message-relay
+service used only to exchange trade offers/acceptances — it never sees keys or signs
+anything. Set `Valence` in `Config` alongside `Mempool`/`Storage` to use it:
+
+```go
+w := sdkgo.NewWallet(sdkgo.Config{
+	Mempool: "https://mempool.lineage.to",
+	Storage: "https://storage.lineage.to",
+	Valence: "https://valence.lineage.to",
+})
+```
+
+The flow has four `Wallet` methods:
+
+```go
+// Party A offers sendingAsset to paymentAddress in exchange for receivingAsset,
+// paid to receiveKeypair's address. allKeypairs sources the inputs for A's own
+// half. Returns a PendingHalf — persist it; FetchPending2WayPayment needs it
+// later to recognize and settle the trade once accepted.
+func (w *Wallet) Make2WayPayment(ctx context.Context, paymentAddress string, sendingAsset, receivingAsset Asset, allKeypairs []crypto.EncryptedKeypair, receiveKeypair crypto.EncryptedKeypair) (PendingHalf, error)
+
+// Party B (or A, on a later poll) checks its mailboxes for offers matching
+// stored: any that the counterparty has accepted are settled (submitted to
+// this wallet's own mempool) and returned in settled; everything else still
+// outstanding is returned in pending, keyed by DRUID.
+func (w *Wallet) FetchPending2WayPayment(ctx context.Context, stored []PendingHalf, allKeypairs []crypto.EncryptedKeypair) (pending map[string]Pending2WTxDetails, settled []string, err error)
+
+// Party B accepts a pending offer: pays details.SenderExpectation's asset,
+// submits the transaction to details.MempoolHost, and posts the acceptance
+// back to valence so A's next FetchPending2WayPayment settles it.
+func (w *Wallet) Accept2WayPayment(ctx context.Context, details Pending2WTxDetails, allKeypairs []crypto.EncryptedKeypair) error
+
+// Party B declines instead: no transaction is built, only the rejected
+// status is posted back to valence.
+func (w *Wallet) Reject2WayPayment(ctx context.Context, details Pending2WTxDetails, allKeypairs []crypto.EncryptedKeypair) error
+```
+
+A full round trip — A offers an item for tokens, B accepts, A settles:
+
+```go
+half, err := walletA.Make2WayPayment(ctx, bAddress,
+	sdkgo.NewItemAsset(50, "default_genesis_hash", nil), // A sends 50 items
+	sdkgo.NewTokenAsset(100),                            // A wants 100 tokens back
+	[]crypto.EncryptedKeypair{aItemKeypair}, aReceiveKeypair)
+// persist half (keyed by half.Druid) until it settles
+
+// ...on B's side, out of band:
+pending, _, err := walletB.FetchPending2WayPayment(ctx, nil, []crypto.EncryptedKeypair{bKeypair})
+offer := pending[half.Druid]
+err = walletB.Accept2WayPayment(ctx, offer, []crypto.EncryptedKeypair{bKeypair})
+
+// ...back on A's side, a later poll settles it:
+_, settled, err := walletA.FetchPending2WayPayment(ctx, []sdkgo.PendingHalf{half}, []crypto.EncryptedKeypair{aReceiveKeypair})
+// settled now contains half.Druid; A holds the tokens, B holds the item.
+```
+
+This is wire- and protocol-compatible with sdk-js's and sdk-python's two-way payment
+support: any of the three SDKs can make the offer, accept it, or settle it, in any
+combination — they all speak the same DRUID transaction shape and the same plaintext
+Valence mailbox format.
+
+See `twoway_e2e_test.go` (build-tagged `e2e`) for a complete two-wallet live example.
+
+## Two-way payment live e2e
+
+`twoway_e2e_test.go` (build-tagged `e2e`) drives a complete two-wallet atomic swap
+against the live Lineage testnet: it creates wallets A and B, funds both from the
+testnet miner's faucet, mints an item to A, has A offer that item to B in exchange
+for tokens, has B accept, has A settle, and polls both wallets' balances to confirm
+the swap landed atomically (A ends up with the tokens, B ends up with the item).
+
+Because it funds real wallets and submits live transactions, it only runs with
+`LINEAGE_E2E_WRITE=1` set; without it (or without the `e2e` build tag, under which
+this file doesn't even compile) it's skipped:
+
+```bash
+LINEAGE_E2E_WRITE=1 go test -tags=e2e -run TestTwoWaySwap_Live -v ./... -timeout 10m
+```
 
 ## Testing
 
 ```bash
 go test ./...                        # unit tests (fast, no network)
 go test -tags=integration ./...      # + wire-compat integration test, needs LINEAGE_TEST_HOST
+go test -tags=e2e ./...              # + two-way live e2e, needs LINEAGE_E2E_WRITE=1 to write
 go vet ./...
 ```
