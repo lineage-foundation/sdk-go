@@ -4,6 +4,8 @@ Go SDK for the Lineage `/v1` REST API: a keyless read `Client` and a key-holding
 
 ## Installation
 
+Published as the Go module [`github.com/lineage-foundation/sdk-go`](https://pkg.go.dev/github.com/lineage-foundation/sdk-go).
+
 ```bash
 go get github.com/lineage-foundation/sdk-go
 ```
