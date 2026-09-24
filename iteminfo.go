@@ -106,6 +106,10 @@ func WithoutEnrichment() BalanceOption {
 func (c *Client) enrichBalance(ctx context.Context, bal *FetchBalanceResponse) {
 	defer func() { _ = recover() }()
 
+	if c.storage == "" {
+		return // no storage host configured: enrichment is silently skipped
+	}
+
 	hashes := make(map[string]struct{})
 	for _, entries := range bal.AddressList {
 		for _, e := range entries {
@@ -140,6 +144,8 @@ func (c *Client) enrichBalance(ctx context.Context, bal *FetchBalanceResponse) {
 			// Only overwrite on a successful resolve (cache hit); a miss must
 			// not clobber metadata the item already carried.
 			if info, ok := c.cacheGetItemInfo(entries[i].Value.GenesisHash); ok {
+				// Aliases the cached ItemInfo's metadata pointer, not a copy:
+				// callers must treat entries[i].Value.Metadata as read-only.
 				entries[i].Value.Metadata = info.Metadata
 			}
 		}

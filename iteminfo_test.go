@@ -157,6 +157,23 @@ func TestFetchBalance_EnrichesItemMetadata(t *testing.T) {
 	}
 }
 
+func TestFetchBalance_NoStorageHostSkipsEnrichment(t *testing.T) {
+	mempool := balanceServer(t, balanceBody(`"addr1":[`+itemUTXO("t0", "gh1", `"inline meta"`)+`]`))
+	defer mempool.Close()
+
+	// No storage server at all: if enrichment tried to resolve, there would
+	// be nothing listening and the request would fail/hang.
+	w := newTestWallet(t, mempool.URL, "")
+	bal, err := w.FetchBalance(context.Background(), []string{"addr1"})
+	if err != nil {
+		t.Fatalf("FetchBalance: %v", err)
+	}
+	entry := bal.AddressList["addr1"][0]
+	if entry.Value.Metadata == nil || *entry.Value.Metadata != "inline meta" {
+		t.Fatalf("metadata: got %v want unchanged inline value", entry.Value.Metadata)
+	}
+}
+
 func TestFetchBalance_DedupsAndCachesAcrossListings(t *testing.T) {
 	// Two addresses, same genesis hash -> exactly one resolver call.
 	body := balanceBody(`"addr1":[` + itemUTXO("t0", "gh1", "null") + `],"addr2":[` + itemUTXO("t1", "gh1", "null") + `]`)
