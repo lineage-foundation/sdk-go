@@ -202,10 +202,28 @@ func (w *Wallet) GetNewKeypair(existing []string) (crypto.EncryptedKeypair, erro
 	return crypto.EncryptKeypair(kp, addr, nonce, w.encKey), nil
 }
 
-// FetchBalance returns UTXO balances for the given addresses. Delegates to
-// the embedded Client's QueryBalances. Mirrors sdk-js's Wallet.fetchBalance.
-func (w *Wallet) FetchBalance(ctx context.Context, addrs []string) (FetchBalanceResponse, error) {
-	return w.QueryBalances(ctx, addrs)
+// FetchBalance returns UTXO balances for the given addresses and, by default,
+// enriches every item UTXO with its genesis metadata resolved from the storage
+// node (see Client.GetItemInfo). Enrichment is best-effort: it never causes
+// this call to fail, resolves each distinct item at most once per Client
+// instance, and leaves an item's metadata untouched when its resolve fails or
+// the item is unknown. Pass WithoutEnrichment() to skip enrichment entirely.
+// Delegates the balance read to the embedded Client's QueryBalances. Mirrors
+// sdk-js's Wallet.fetchBalance.
+func (w *Wallet) FetchBalance(ctx context.Context, addrs []string, opts ...BalanceOption) (FetchBalanceResponse, error) {
+	options := balanceOptions{enrich: true}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	bal, err := w.QueryBalances(ctx, addrs)
+	if err != nil {
+		return bal, err
+	}
+	if options.enrich {
+		w.enrichBalance(ctx, &bal)
+	}
+	return bal, nil
 }
 
 // CreateItems creates item assets against addr's address: it signs the
@@ -315,7 +333,7 @@ func (w *Wallet) makePayment(ctx context.Context, paymentAddress string, asset A
 		keyPairs[enc.Address] = kp
 	}
 
-	balance, err := w.FetchBalance(ctx, addresses)
+	balance, err := w.QueryBalances(ctx, addresses)
 	if err != nil {
 		return CreateTransactionsResponse{}, fmt.Errorf("sdkgo: fetch balance: %w", err)
 	}
@@ -527,7 +545,7 @@ func (w *Wallet) Make2WayPayment(ctx context.Context, paymentAddress string, sen
 		return PendingHalf{}, err
 	}
 
-	balance, err := w.FetchBalance(ctx, addresses)
+	balance, err := w.QueryBalances(ctx, addresses)
 	if err != nil {
 		return PendingHalf{}, fmt.Errorf("sdkgo: fetch balance: %w", err)
 	}
@@ -715,7 +733,7 @@ func (w *Wallet) handle2WTxResponse(ctx context.Context, details Pending2WTxDeta
 	details.Status = status
 
 	if status == Pending2WTxStatusAccepted {
-		balance, err := w.FetchBalance(ctx, addresses)
+		balance, err := w.QueryBalances(ctx, addresses)
 		if err != nil {
 			return fmt.Errorf("sdkgo: fetch balance: %w", err)
 		}

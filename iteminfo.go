@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"sync"
 )
 
 // ItemCreated records where an item class was minted: the block number and the
@@ -76,4 +77,71 @@ func (c *Client) GetItemInfo(ctx context.Context, genesisHash string) (ItemInfo,
 // simply leaves the item's metadata untouched.
 func (c *Client) fetchItemInfo(ctx context.Context, genesisHash string) {
 	_, _ = c.resolveItemInfo(ctx, genesisHash)
+}
+
+// balanceOptions holds the resolved settings for a balance listing.
+type balanceOptions struct {
+	enrich bool
+}
+
+// BalanceOption customizes a balance listing (see Wallet.FetchBalance).
+type BalanceOption func(*balanceOptions)
+
+// WithoutEnrichment disables item-metadata enrichment for a single balance
+// listing: no resolver calls are issued and item metadata is left exactly as
+// the node returned it.
+func WithoutEnrichment() BalanceOption {
+	return func(o *balanceOptions) { o.enrich = false }
+}
+
+// enrichBalance attaches each item's genesis metadata to the item UTXOs in bal,
+// in place. It collects the distinct item genesis hashes, resolves the
+// cache-misses concurrently (one goroutine per distinct miss), and writes the
+// resolved metadata onto every matching item.
+//
+// Enrichment is best-effort: it never returns an error, a failed or unknown
+// (404) resolve leaves that item's metadata untouched (so inline metadata is
+// preserved and transferred items keep their nil), and each resolve goroutine
+// recovers from any panic so enrichment can never fail the enclosing listing.
+func (c *Client) enrichBalance(ctx context.Context, bal *FetchBalanceResponse) {
+	defer func() { _ = recover() }()
+
+	hashes := make(map[string]struct{})
+	for _, entries := range bal.AddressList {
+		for _, e := range entries {
+			if e.Value.Kind == AssetKindItem && e.Value.GenesisHash != "" {
+				hashes[e.Value.GenesisHash] = struct{}{}
+			}
+		}
+	}
+	if len(hashes) == 0 {
+		return
+	}
+
+	var wg sync.WaitGroup
+	for h := range hashes {
+		if _, ok := c.cacheGetItemInfo(h); ok {
+			continue // already resolved on a previous listing
+		}
+		wg.Add(1)
+		go func(hash string) {
+			defer wg.Done()
+			defer func() { _ = recover() }()
+			c.fetchItemInfo(ctx, hash)
+		}(h)
+	}
+	wg.Wait()
+
+	for _, entries := range bal.AddressList {
+		for i := range entries {
+			if entries[i].Value.Kind != AssetKindItem {
+				continue
+			}
+			// Only overwrite on a successful resolve (cache hit); a miss must
+			// not clobber metadata the item already carried.
+			if info, ok := c.cacheGetItemInfo(entries[i].Value.GenesisHash); ok {
+				entries[i].Value.Metadata = info.Metadata
+			}
+		}
+	}
 }
