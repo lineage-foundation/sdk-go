@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -41,6 +42,15 @@ type Client struct {
 	valence    string
 	apiKey     string
 	httpClient *http.Client
+
+	// itemInfoMu guards itemInfoCache.
+	itemInfoMu sync.RWMutex
+	// itemInfoCache memoizes successful GET /v1/items/{genesis_hash}
+	// resolves, keyed by genesis hash. Item genesis facts are immutable, so
+	// entries never expire and only HTTP 200 responses are stored (failures
+	// stay retryable). Populated by resolveItemInfo; read during holdings
+	// enrichment and by GetItemInfo.
+	itemInfoCache map[string]ItemInfo
 }
 
 // NewClient builds a Client from the given Config. If cfg.HTTPClient is nil, a
@@ -51,11 +61,12 @@ func NewClient(cfg Config) *Client {
 		httpClient = &http.Client{Timeout: defaultHTTPTimeout}
 	}
 	return &Client{
-		mempool:    cfg.Mempool,
-		storage:    cfg.Storage,
-		valence:    cfg.Valence,
-		apiKey:     cfg.APIKey,
-		httpClient: httpClient,
+		mempool:       cfg.Mempool,
+		storage:       cfg.Storage,
+		valence:       cfg.Valence,
+		apiKey:        cfg.APIKey,
+		httpClient:    httpClient,
+		itemInfoCache: make(map[string]ItemInfo),
 	}
 }
 

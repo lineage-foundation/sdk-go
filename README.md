@@ -74,6 +74,22 @@ func main() {
 
 `Wallet` embeds `*Client`, so every read method (`Supply`, `Balances`, `TransactionStatus`, `LatestBlock`, `BlockByNum`, `BlockchainEntry`, `SerializeTransactions`, `DeserializeTransactions`, ...) is available directly on a `Wallet` too. Use a bare `sdkgo.NewClient(cfg)` for read-only use cases that never sign anything.
 
+## Item metadata enrichment
+
+Items only carry their genesis hash once transferred, so `Wallet.FetchBalance` attaches each item's genesis `metadata` by default, resolved from the configured `Storage` node and cached per `Client`/`Wallet` instance. Pass `sdkgo.WithoutEnrichment()` to skip it for a single call:
+
+```go
+balance, err := w.FetchBalance(ctx, addresses, sdkgo.WithoutEnrichment())
+```
+
+Use `Client.GetItemInfo(ctx, genesisHash)` for an item's full genesis facts — total supply, creator address, and the block/tx it was created in:
+
+```go
+info, err := w.GetItemInfo(ctx, genesisHash)
+```
+
+Enrichment requires `Config.Storage`; without it, enrichment is silently skipped (`FetchBalance` still succeeds and items keep the metadata the node returned), while `GetItemInfo` returns an error.
+
 ## Two-way (DRUID) payments
 
 A two-way payment is an atomic swap between two parties, brokered through [Valence](https://github.com/lineage-foundation/valence), a plaintext message-relay service that exchanges trade offers/acceptances but never sees keys or signs anything.
